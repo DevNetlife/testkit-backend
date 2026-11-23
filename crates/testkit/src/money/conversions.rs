@@ -90,8 +90,8 @@ pub fn to_stroops_with_decimals(value: i128, decimals: u32) -> Result<i128, Test
 /// assert_eq!(from_stroops(9_999_999), (0, 9_999_999));
 /// ```
 pub fn from_stroops(stroops: i128) -> (i128, i128) {
-    let whole = stroops.div_euclid(STELLAR_SCALE);
-    let remainder = stroops.rem_euclid(STELLAR_SCALE);
+    let whole = stroops / STELLAR_SCALE;
+    let remainder = (stroops % STELLAR_SCALE).abs();
     (whole, remainder)
 }
 
@@ -109,9 +109,11 @@ pub fn from_stroops(stroops: i128) -> (i128, i128) {
 pub fn stroops_to_decimal_string(stroops: i128, decimals: u32) -> String {
     let sign = if stroops < 0 { "-" } else { "" };
     let abs = stroops.unsigned_abs();
-    let scale = 10_u128.pow(decimals);
-    let whole = abs / scale;
-    let frac = abs % scale;
+    let stroops_per_xlm = 10_u128.pow(7);
+    let whole = abs / stroops_per_xlm;
+    let remainder = abs % stroops_per_xlm;
+    let scale = 10_u128.pow(decimals.min(18));
+    let frac = remainder.saturating_mul(scale) / stroops_per_xlm;
     format!("{sign}{whole}.{frac:0width$}", width = decimals as usize)
 }
 

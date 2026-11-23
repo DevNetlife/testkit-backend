@@ -486,7 +486,10 @@ impl TestkitError {
     /// assert!(err.to_string().contains("seed=42"));
     /// ```
     pub fn with_env_metadata(self, metadata: &EnvMetadata) -> Self {
-        self.with_context(format!("environment metadata: [{}]", metadata.failure_context()))
+        self.with_context(format!(
+            "environment metadata: [{}]",
+            metadata.failure_context()
+        ))
     }
 
     /// Format this error together with the provided environment metadata as an actionable failure report.

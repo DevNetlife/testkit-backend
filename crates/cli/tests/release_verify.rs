@@ -60,10 +60,8 @@ fn release_verify_passes_against_the_current_workspace() {
 
 #[test]
 fn release_verify_rejects_a_missing_workspace() {
-    let tmp = std::env::temp_dir().join(format!(
-        "stk-release-verify-missing-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("stk-release-verify-missing-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let output = run_from(&tmp, &["release-verify"]);
     assert!(!output.status.success());

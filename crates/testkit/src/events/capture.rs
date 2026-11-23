@@ -87,17 +87,23 @@ impl CapturedEvent {
         let mut out = String::new();
         out.push_str("CapturedEvent {\n");
         out.push_str(&format!("  contract: {:?},\n", self.contract));
-        out.push_str(&format!("  topics: [{}],\n", if self.topics.is_empty() {
-            String::new()
-        } else {
-            let rendered: Vec<String> = self
-                .topics
-                .iter()
-                .map(|t| format!("\n    {}", decode_topic_diagnostic(env, t)))
-                .collect();
-            rendered.join(",")
-        }));
-        out.push_str(&format!("  data: {},\n", decode_val_diagnostic(env, &self.data)));
+        out.push_str(&format!(
+            "  topics: [{}],\n",
+            if self.topics.is_empty() {
+                String::new()
+            } else {
+                let rendered: Vec<String> = self
+                    .topics
+                    .iter()
+                    .map(|t| format!("\n    {}", decode_topic_diagnostic(env, t)))
+                    .collect();
+                rendered.join(",")
+            }
+        ));
+        out.push_str(&format!(
+            "  data: {},\n",
+            decode_val_diagnostic(env, &self.data)
+        ));
         out.push('}');
         out
     }

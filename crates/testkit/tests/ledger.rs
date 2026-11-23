@@ -193,7 +193,11 @@ fn a_checkpoint_taken_inside_a_scope_restores_the_scoped_position() {
     env.advance(Duration::from_secs(100)); // (100, 20)
 
     let inside = env.at(40, || env.checkpoint());
-    assert_eq!(clock(&env), (100, 20), "the scope must restore the pre-scope clock");
+    assert_eq!(
+        clock(&env),
+        (100, 20),
+        "the scope must restore the pre-scope clock"
+    );
 
     env.restore_checkpoint(inside);
     assert_eq!(clock(&env), (40, 8));

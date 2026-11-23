@@ -1,7 +1,7 @@
 #![cfg(feature = "testutils")]
 
 use soroban_sdk::{testutils::Address as _, Address, Env};
-use vault::{Vault, VaultClient, VaultError};
+use vault::{Treasury, Vault, VaultClient, VaultError};
 
 #[test]
 fn vault_initialization_and_deposit() {

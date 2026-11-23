@@ -80,6 +80,62 @@ fn sanitize_snippet(line: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// GitHub Actions workflow command level for a finding severity.
+fn annotation_level(severity: &str) -> &'static str {
+    match severity {
+        "error" => "error",
+        "warning" => "warning",
+        _ => "notice",
+    }
+}
+
+/// Escape a workflow-command property value (`%`, CR, LF, colon, comma).
+fn escape_annotation_property(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
+/// Escape a workflow-command message payload (`%`, CR, LF).
+fn escape_annotation_message(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Render one GitHub Actions workflow annotation per finding.
+///
+/// Annotations go to stderr only, so `--format json`/`sarif` stdout stays
+/// machine-parseable. The stable rule id is used as the annotation `title`.
+fn render_annotations(findings: &[Finding]) -> Vec<String> {
+    findings
+        .iter()
+        .map(|finding| {
+            let level = annotation_level(&finding.severity);
+            let file = escape_annotation_property(&finding.file.to_string_lossy());
+            let mut properties = format!(
+                "file={file},line={},title={}",
+                finding.line,
+                escape_annotation_property(rule_identifier(finding.rule))
+            );
+            if let Some(end) = finding.end_line {
+                if end > finding.line {
+                    properties.push_str(&format!(",endLine={end}"));
+                }
+            }
+            let message = escape_annotation_message(&sanitize_snippet(&format!(
+                "heuristic finding (manual review): {}",
+                finding.message
+            )));
+            format!("::{level} {properties}::{message}")
+        })
+        .collect()
+}
+
 /// Arguments for `soroban-testkit audit`.
 #[derive(Args)]
 pub struct AuditArgs {
@@ -156,15 +212,21 @@ pub struct AuditArgs {
     /// patterns are specified).
     #[arg(long = "include", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
     pub include: Vec<String>,
+    /// Path to a project-level audit config, overriding automatic discovery.
+    /// Defaults to `.soroban-testkit.toml` (then `soroban-testkit.toml`) searched from
+    /// the scan root up to the workspace root.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
+    /// Emit GitHub Actions workflow annotations (`::warning file=...`) on stderr.
+    /// Findings are heuristic signals for manual review; annotations never change
+    /// stdout or exit codes.
+    #[arg(long, global = true)]
+    pub annotations: bool,
     /// Exclude glob patterns to filter scanned files. Can be specified multiple times.
     /// Files matching any exclude pattern are skipped. Exclude patterns take precedence
     /// over include patterns.
     #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
     pub exclude: Vec<String>,
-    /// Exclude directory path(s) relative to the workspace root from recursive scans.
-    /// Repeatable. Exact relative directory paths only (glob patterns are not supported).
-    #[arg(long = "exclude", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
-    pub exclude: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -335,10 +397,6 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         ));
     }
 
-    match &args.command {
-        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
-        Some(AuditCommand::Rules) => return list_rules(args.format),
-        None => {}
     if args.list_rules
         || matches!(
             &args.command,
@@ -438,10 +496,10 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
     };
     let workspace = find_workspace_root(&source_dir);
-    let config = load_config(&source_dir, &workspace)?;
+    let config = load_config(&source_dir, &workspace, args.config.as_deref())?;
 
     let mut raw_exclusions = config.exclude.clone();
-    raw_exclusions.extend(args.exclude.clone());
+    raw_exclusions.extend(args.exclude.iter().map(PathBuf::from));
     let exclusions = normalize_and_validate_exclusions(&raw_exclusions, &workspace)?;
 
     let sources = if stdin {
@@ -451,6 +509,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
             &args.path,
             &workspace,
             &exclusions,
+            &args.include,
+            &args.exclude,
             &mut parse_warnings,
         )?
     };
@@ -504,13 +564,10 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
     let use_color = should_color(args.no_color);
     let rendered_report = if args.summary_only {
-        DiagnosticRenderer::new(&findings).render_text_summary_colored(use_color)
+        DiagnosticRenderer::new(&findings).render_summary_only_colored(use_color)
     } else if args.format == AuditOutputFormat::Text {
         DiagnosticRenderer::new(&findings).render_text_colored_with_width(use_color, width)
     } else {
-        render_findings_with_limitations(
-    print!(
-        "{}",
         render_findings_with_limitations_and_scanned(
             &findings,
             args.format,
@@ -520,6 +577,13 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         )?
     };
     print!("{rendered_report}");
+
+    // #318: workflow annotations are an additive stderr channel.
+    if args.annotations {
+        for annotation in render_annotations(&findings) {
+            eprintln!("{annotation}");
+        }
+    }
 
     // Findings (heuristic pattern matches over parsed source) were just
     // rendered above; these are parse warnings (inputs that were never
@@ -869,7 +933,9 @@ pub fn matches_filter(
 
     // 2. Include patterns: if specified, must match at least one
     if !include_patterns.is_empty() {
-        return include_patterns.iter().any(|pat| glob_matches(pat, rel_norm));
+        return include_patterns
+            .iter()
+            .any(|pat| glob_matches(pat, rel_norm));
     }
 
     // 3. Otherwise included by default
@@ -883,23 +949,8 @@ fn collect_rust_sources(
     collect_rust_sources_filtered(root, warnings, &[], &[])
 }
 
-fn collect_rust_sources_filtered(
-    root: &Path,
-    warnings: &mut Vec<CliError>,
-    include_patterns: &[String],
-    exclude_patterns: &[String],
-) -> Result<Vec<PathBuf>, CliError> {
+fn check_scan_path(root: &Path) -> Result<fs::Metadata, CliError> {
     let metadata = fs::metadata(root).map_err(|err| {
-    collect_rust_sources_with_exclusions(root, root, &[], warnings)
-}
-
-fn collect_rust_sources_with_exclusions(
-    root: &Path,
-    workspace: &Path,
-    exclusions: &[PathBuf],
-    warnings: &mut Vec<CliError>,
-) -> Result<Vec<PathBuf>, CliError> {
-    fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
                 "path {} does not exist; pass a contract crate directory, a single .rs file, \
@@ -913,36 +964,96 @@ fn collect_rust_sources_with_exclusions(
             ))
         }
     })?;
+    Ok(metadata)
+}
 
+fn is_scannable_dir(entry: &walkdir::DirEntry, workspace: &Path, exclusions: &[PathBuf]) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name.as_ref()) {
+        return false;
+    }
+    let rel = workspace_relative_path(entry.path(), workspace);
+    !exclusions
+        .iter()
+        .any(|excl| rel == *excl || rel.starts_with(excl))
+}
+
+fn collect_rust_sources_filtered(
+    root: &Path,
+    warnings: &mut Vec<CliError>,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<Vec<PathBuf>, CliError> {
+    let metadata = check_scan_path(root)?;
     if metadata.is_file() {
         let file_name = root.file_name().unwrap_or_default().to_string_lossy();
-        if matches_filter(&file_name, include_patterns, exclude_patterns) {
-            return Ok(vec![root.to_path_buf()]);
-        } else {
-            return Ok(Vec::new());
-        }
+        return Ok(
+            if matches_filter(&file_name, include_patterns, exclude_patterns) {
+                vec![root.to_path_buf()]
+            } else {
+                Vec::new()
+            },
+        );
     }
 
-    let is_root_file = root.is_file();
+    let workspace = find_workspace_root(root);
     let mut sources = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| {
-            if !entry.file_type().is_dir() {
-                return true;
+        .filter_entry(|entry| is_scannable_dir(entry, &workspace, &[]))
+    {
+        let entry = entry.map_err(|err| {
+            CliError(format!(
+                "failed to scan directory {}: {err}; check path permissions and re-run",
+                err.path().unwrap_or(root).display()
+            ))
+        })?;
+        if entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "rs") {
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            if matches_filter(&rel.to_string_lossy(), include_patterns, exclude_patterns) {
+                sources.push(entry.path().to_path_buf());
             }
-            if entry.depth() == 0 {
-                return true;
-            }
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-            if name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name.as_ref()) {
-                return false;
-            }
-            let rel = workspace_relative_path(entry.path(), workspace);
-            !exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl))
-        })
+        }
+    }
+    sources.sort();
+    let _ = warnings;
+    Ok(sources)
+}
+
+fn collect_rust_sources_with_exclusions(
+    root: &Path,
+    workspace: &Path,
+    exclusions: &[PathBuf],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    warnings: &mut Vec<CliError>,
+) -> Result<Vec<PathBuf>, CliError> {
+    let metadata = check_scan_path(root)?;
+    let is_root_file = metadata.is_file();
+    if is_root_file {
+        let rel = workspace_relative_path(root, workspace);
+        let excluded = exclusions
+            .iter()
+            .any(|excl| rel == *excl || rel.starts_with(excl));
+        let rel_str = rel.to_string_lossy();
+        return Ok(
+            if excluded || !matches_filter(&rel_str, include_patterns, exclude_patterns) {
+                Vec::new()
+            } else {
+                vec![root.to_path_buf()]
+            },
+        );
+    }
+
+    let mut sources = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| is_scannable_dir(entry, workspace, exclusions))
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -954,20 +1065,10 @@ fn collect_rust_sources_with_exclusions(
                 continue;
             }
         };
-        let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
-        if entry.file_type().is_file() && is_rust {
-            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
-            let rel_str = rel.to_string_lossy();
-            if matches_filter(&rel_str, include_patterns, exclude_patterns) {
+        if entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "rs") {
+            let rel = workspace_relative_path(entry.path(), workspace);
+            if matches_filter(&rel.to_string_lossy(), include_patterns, exclude_patterns) {
                 sources.push(entry.path().to_path_buf());
-            if entry.depth() == 0 && is_root_file {
-                sources.push(entry.path().to_path_buf());
-            } else {
-                let rel = workspace_relative_path(entry.path(), workspace);
-                let is_excluded = exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl));
-                if !is_excluded {
-                    sources.push(entry.path().to_path_buf());
-                }
             }
         }
     }
@@ -1053,23 +1154,10 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         explanation: "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
-        }
-        _ => return Err(CliError(format!("unknown rule: {}", rule))),
-    };
-
-    let meta = RULES.iter().find(|m| m.id == rule);
-    println!("{explanation}");
-    if let Some(m) = meta {
-        println!("\nConfidence: {}", m.confidence);
-        println!("Known limitations:");
-        for lim in m.limitations {
-            println!("- {lim}");
-        }
-    }
-    println!("\nnote: {FINDING_NATURE}");
-    Ok(())
-}
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
+        remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
+    },
+];
 
 /// Static metadata for an audit rule, including confidence and verified limitations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1157,13 +1245,41 @@ pub const RULES: &[RuleMeta] = &[
     },
 ];
 
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
-        remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
-    },
-];
-
 pub fn find_rule(id: &str) -> Option<&'static RuleDefinition> {
     RULE_REGISTRY.iter().find(|r| r.id == id)
+}
+
+/// Documented default configuration for a rule: every rule starts enabled,
+/// with the severity declared in the central registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleDefaults {
+    pub id: &'static str,
+    pub enabled: bool,
+    pub severity: &'static str,
+}
+
+/// Return the documented default for `id`, if it is a registered rule.
+pub fn default_for_rule(id: &str) -> Option<RuleDefaults> {
+    RULE_REGISTRY
+        .iter()
+        .find(|rule| rule.id == id)
+        .map(|rule| RuleDefaults {
+            id: rule.id,
+            enabled: true,
+            severity: rule.severity,
+        })
+}
+
+/// Stable machine-readable identifier for a finding's rule.
+///
+/// Never returns a prose description: consumers may key dashboards, baselines
+/// and suppression files on this value across releases.
+pub fn rule_identifier(rule: &str) -> &'static str {
+    RULE_REGISTRY
+        .iter()
+        .find(|candidate| candidate.id == rule)
+        .map(|candidate| candidate.id)
+        .unwrap_or("unknown-rule")
 }
 
 fn explain_rule(rule: &str) -> Result<(), CliError> {
@@ -1172,21 +1288,33 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
     // defect: state the heuristic nature right next to the rule so the
     // distinction between "flagged" and "broken" is never left to guesswork.
     println!("{}\n\nnote: {FINDING_NATURE}", def.explanation);
+    if let Some(defaults) = default_for_rule(def.id) {
+        println!(
+            "Default: enabled={}, severity={}",
+            defaults.enabled, defaults.severity
+        );
+    }
     Ok(())
 }
 
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
+            println!(
+                "{:<36} {:<10} {:<12} DESCRIPTION",
+                "RULE", "SEVERITY", "CONFIDENCE"
+            );
             println!("{}", "-".repeat(100));
-            for rule in RULES {
-                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, rule.confidence, rule.description);
+            let mut rules: Vec<_> = RULES.iter().collect();
+            rules.sort_by(|a, b| a.id.cmp(b.id));
+            for rule in rules {
+                println!(
+                    "{:<36} {:<10} {:<12} {}",
+                    rule.id, rule.severity, rule.confidence, rule.description
+                );
                 for lim in rule.limitations {
                     println!("    * limitation: {lim}");
                 }
-            for rule in RULE_REGISTRY {
-                println!("{:<40} {:<10} {}", rule.id, rule.severity, rule.description);
             }
             println!("note: {FINDING_NATURE}");
             Ok(())
@@ -1195,13 +1323,16 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             let rules: Vec<_> = RULE_REGISTRY
                 .iter()
                 .map(|rule| {
+                    let meta = RULES.iter().find(|m| m.id == rule.id);
                     serde_json::json!({
                         "id": rule.id,
+                        "identifier": rule_identifier(rule.id),
                         "severity": rule.severity,
-                        "confidence": rule.confidence,
+                        "defaultEnabled": true,
+                        "defaultSeverity": find_rule(rule.id).map(|r| r.severity).unwrap_or("warning"),
+                        "confidence": meta.map(|m| m.confidence).unwrap_or("unknown"),
                         "description": rule.description,
-                        "limitations": rule.limitations,
-                        "description": rule.description,
+                        "limitations": meta.map(|m| m.limitations).unwrap_or(&[]),
                         "remediation": rule.remediation,
                     })
                 })
@@ -1222,6 +1353,7 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             let rules: Vec<_> = RULE_REGISTRY
                 .iter()
                 .map(|rule| {
+                    let meta = RULES.iter().find(|m| m.id == rule.id);
                     serde_json::json!({
                         "id": rule.id,
                         "shortDescription": { "text": rule.id.replace('-', " ") },
@@ -1230,8 +1362,8 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                             "level": sarif_level(rule.severity)
                         },
                         "properties": {
-                            "confidence": rule.confidence,
-                            "limitations": rule.limitations,
+                            "confidence": meta.map(|m| m.confidence).unwrap_or("unknown"),
+                            "limitations": meta.map(|m| m.limitations).unwrap_or(&[]),
                         }
                     })
                 })
@@ -1273,11 +1405,7 @@ pub fn visible_width(s: &str) -> usize {
 /// Wraps the human-readable message part of a finding at word boundaries,
 /// leaving the location prefix intact on line 1, and indenting continuation
 /// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
-pub fn wrap_finding_message(
-    prefix: &str,
-    message: &str,
-    width: Option<usize>,
-) -> String {
+pub fn wrap_finding_message(prefix: &str, message: &str, width: Option<usize>) -> String {
     let Some(max_width) = width else {
         return format!("{prefix}{message}\n");
     };
@@ -1343,7 +1471,10 @@ fn validate_width_str(val: &str) -> Result<usize, CliError> {
     }
 }
 
-fn resolve_width(cli_width: &Option<String>, config: &AuditConfig) -> Result<Option<usize>, CliError> {
+fn resolve_width(
+    cli_width: &Option<String>,
+    config: &AuditConfig,
+) -> Result<Option<usize>, CliError> {
     if let Some(w) = cli_width {
         return validate_width_str(w).map(Some);
     }
@@ -1394,6 +1525,8 @@ pub fn should_color(no_color_flag: bool) -> bool {
     }
     use std::io::IsTerminal;
     std::io::stdout().is_terminal()
+}
+
 /// Counts of findings for a single rule within a severity level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleFindingCount {
@@ -1558,6 +1691,35 @@ impl<'a> DiagnosticRenderer<'a> {
         }
     }
 
+    /// Render the `--summary-only` report, including stable rule identifiers.
+    ///
+    /// The full text report already prints rule ids on each finding line; the
+    /// summary-only mode has no finding lines, so it prints the per-rule
+    /// breakdown here to keep stable ids available in every output format.
+    pub fn render_summary_only_colored(&self, color: bool) -> String {
+        let mut output = self.render_text_summary_colored(color);
+        if self.findings.is_empty() {
+            return output;
+        }
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
+        output.push_str("Rules:\n");
+        for severity in &summary.severities {
+            for rule in &severity.rules {
+                output.push_str(&format!(
+                    "  - {}: {}\n",
+                    rule_identifier(&rule.rule),
+                    rule.count
+                ));
+            }
+        }
+        output.push('\n');
+        output.push_str(&format!(
+            "  Total: {} finding(s) across {} file(s) scanned\n",
+            summary.total_findings, summary.files_scanned
+        ));
+        output
+    }
+
     /// Render compiler-style human-readable text diagnostics.
     ///
     /// Every finding carries the offending source line (`-->`), with ANSI
@@ -1604,24 +1766,44 @@ impl<'a> DiagnosticRenderer<'a> {
                 )
             };
 
-            output.push_str(&wrap_finding_message(&prefix, &finding.message, width));
-
             let loc = match finding.end_line {
                 Some(end) if end > finding.line => {
-                    format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
+                    format!(
+                        "{}:{}:-{}:",
+                        display_audit_path(&finding.file),
+                        finding.line,
+                        end
+                    )
                 }
                 _ => format!("{}:{}:", display_audit_path(&finding.file), finding.line),
             };
-            output.push_str(&format!(
-                "{} [{}] {}: {}\n",
-                loc,
-                finding.severity,
-                finding.rule,
-                finding.message
-            ));
+            if width.is_some() {
+                let wrapped_prefix = if color {
+                    format!(
+                        "\x1b[1m{}:\x1b[0m \x1b[1;33m[{}]\x1b[0m \x1b[1;36m{}:\x1b[0m ",
+                        loc, finding.severity, finding.rule
+                    )
+                } else {
+                    format!("{} [{}] {}: ", loc, finding.severity, finding.rule)
+                };
+                output.push_str(&wrap_finding_message(
+                    &wrapped_prefix,
+                    &finding.message,
+                    width,
+                ));
+            } else {
+                output.push_str(&format!(
+                    "{} [{}] {}: {}\n",
+                    loc, finding.severity, finding.rule, finding.message
+                ));
+            }
+            let _ = prefix;
             if let Some(snippet) = &finding.source_snippet {
                 if color {
-                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                    output.push_str(&format!(
+                        "    \x1b[1;34m-->\x1b[0m {}\n",
+                        sanitize_snippet(snippet)
+                    ));
                 } else {
                     output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
                 }
@@ -1636,13 +1818,6 @@ impl<'a> DiagnosticRenderer<'a> {
         }
         output.push('\n');
         output.push_str(&self.render_text_summary_colored(color));
-        output.push_str(&format!(
-            "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
-             security product — a missing finding is not a security guarantee.\n",
-            self.findings.len()
-        ));
-        output.push_str(&format!("note: {FINDING_NATURE}\n"));
-        output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
 
         let summary = compute_summary(self.findings, self.effective_files_scanned());
         output.push_str("\nSummary:\n");
@@ -1685,6 +1860,8 @@ impl<'a> DiagnosticRenderer<'a> {
                 if let Some(snippet) = &finding.source_snippet {
                     value["source_snippet"] = serde_json::Value::String(sanitize_snippet(snippet));
                 }
+                value["rule_id"] =
+                    serde_json::Value::String(rule_identifier(finding.rule).to_string());
                 if let Some(rule) = find_rule(finding.rule) {
                     value["remediation"] = serde_json::Value::String(rule.remediation.to_string());
                 }
@@ -1723,7 +1900,7 @@ impl<'a> DiagnosticRenderer<'a> {
             .into_iter()
             .map(|rule| {
                 let meta = RULES.iter().find(|m| m.id == rule);
-                let description = meta.map(|m| m.description);
+                let _description = meta.map(|m| m.description);
                 let description = find_rule(rule).map(|r| r.description);
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
@@ -1736,7 +1913,6 @@ impl<'a> DiagnosticRenderer<'a> {
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
                     .or_else(|| meta.map(|m| m.severity));
-                    .or_else(|| find_rule(rule).map(|r| r.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
@@ -1775,6 +1951,7 @@ impl<'a> DiagnosticRenderer<'a> {
                 }
                 serde_json::json!({
                     "ruleId": finding.rule,
+                    "properties": { "stableRuleId": rule_identifier(finding.rule) },
                     "level": sarif_level(&finding.severity),
                     "message": { "text": finding.message },
                     "locations": [{
@@ -2054,6 +2231,32 @@ fn validate_audit_config_table(
                 continue;
             }
 
+            if key == "width" {
+                let rendered = match val {
+                    toml::Value::Integer(value) if *value >= 0 => value.to_string(),
+                    toml::Value::String(value) => value.clone(),
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `width` must be a positive integer or width string"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if let Err(message) = validate_width_str(&rendered) {
+                    let line = find_line_for_key(content, &full_key);
+                    errors.push(ConfigValidationError {
+                        line,
+                        key_path: full_key,
+                        message: message.0,
+                    });
+                }
+                continue;
+            }
+
             if key == "exclude" {
                 match val {
                     toml::Value::String(_) => {}
@@ -2064,7 +2267,9 @@ fn validate_audit_config_table(
                                 errors.push(ConfigValidationError {
                                     line,
                                     key_path: full_key.clone(),
-                                    message: "key `exclude` elements must be directory path strings".to_string(),
+                                    message:
+                                        "key `exclude` elements must be directory path strings"
+                                            .to_string(),
                                 });
                                 break;
                             }
@@ -2075,7 +2280,9 @@ fn validate_audit_config_table(
                         errors.push(ConfigValidationError {
                             line,
                             key_path: full_key,
-                            message: "key `exclude` must be a string or list of directory path strings".to_string(),
+                            message:
+                                "key `exclude` must be a string or list of directory path strings"
+                                    .to_string(),
                         });
                     }
                 }
@@ -2090,10 +2297,36 @@ fn validate_audit_config_table(
             errors.push(ConfigValidationError {
                 line,
                 key_path: full_key,
-                message: "unknown configuration key; valid audit keys are: audit, exclude, rules"
-                    .to_string(),
+                message:
+                    "unknown configuration key; valid audit keys are: audit, exclude, rules, width"
+                        .to_string(),
             });
         } else if prefix == "audit" {
+            if key == "width" {
+                let rendered = match val {
+                    toml::Value::Integer(value) if *value >= 0 => value.to_string(),
+                    toml::Value::String(value) => value.clone(),
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `width` must be a positive integer or width string"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if let Err(message) = validate_width_str(&rendered) {
+                    let line = find_line_for_key(content, &full_key);
+                    errors.push(ConfigValidationError {
+                        line,
+                        key_path: full_key,
+                        message: message.0,
+                    });
+                }
+                continue;
+            }
             if key == "rules" {
                 validate_rules_table(val, content, "audit.rules", errors);
                 continue;
@@ -2129,7 +2362,7 @@ fn validate_audit_config_table(
             errors.push(ConfigValidationError {
                 line,
                 key_path: full_key,
-                message: "unknown configuration key; valid audit keys are: exclude, rules"
+                message: "unknown configuration key; valid audit keys are: exclude, rules, width"
                     .to_string(),
             });
         }
@@ -2165,9 +2398,7 @@ fn validate_rules_table(
             errors.push(ConfigValidationError {
                 line,
                 key_path: rule_key_path,
-                message: format!(
-                    "unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"
-                ),
+                message: format!("unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"),
             });
             continue;
         }
@@ -2217,10 +2448,37 @@ fn validate_rules_table(
     }
 }
 
-fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
+fn load_config(
+    source_dir: &Path,
+    workspace: &Path,
+    explicit_config: Option<&Path>,
+) -> Result<AuditConfig, CliError> {
+    let explicit_path = explicit_config.map(Path::to_path_buf);
+    if let Some(path) = &explicit_path {
+        if !path.exists() {
+            return Err(CliError(format!(
+                "audit config {} does not exist; pass a readable .soroban-testkit.toml path",
+                path.display()
+            )));
+        }
+    }
+    let config_names: Vec<String> = match &explicit_path {
+        Some(path) => vec![path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()],
+        None => vec![
+            ".soroban-testkit.toml".to_string(),
+            "soroban-testkit.toml".to_string(),
+        ],
+    };
     for dir in source_dir.ancestors() {
-        for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
-            let path = dir.join(name);
+        for name in &config_names {
+            let path = match &explicit_path {
+                Some(path) => path.clone(),
+                None => dir.join(name),
+            };
             let content = match fs::read_to_string(&path) {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2244,15 +2502,11 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
             validate_audit_config_table(&table, &content, "", &mut validation_errors);
 
             if !validation_errors.is_empty() {
-                validation_errors.sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
+                validation_errors
+                    .sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
                 let formatted_errors: Vec<String> = validation_errors
                     .into_iter()
-                    .map(|e| {
-                        format!(
-                            "at line {} (key `{}`): {}",
-                            e.line, e.key_path, e.message
-                        )
-                    })
+                    .map(|e| format!("at line {} (key `{}`): {}", e.line, e.key_path, e.message))
                     .collect();
                 return Err(CliError(format!(
                     "failed to validate audit config {}:\n  - {}",
@@ -2306,6 +2560,9 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
             }
 
             return Ok(config);
+        }
+        if explicit_path.is_some() {
+            break;
         }
         if dir == workspace {
             break;
@@ -2971,9 +3228,7 @@ impl FunctionVisitor<'_> {
         // struct; sanitizing happens in the renderer.
         let source_snippet = self.source.get(line).cloned();
 
-        let end_line = fn_range
-            .map(|(_, end)| end)
-            .filter(|&end| end > line);
+        let end_line = fn_range.map(|(_, end)| end).filter(|&end| end > line);
 
         self.findings.push(Finding {
             file: self.path.clone(),
@@ -3552,7 +3807,10 @@ mod tests {
                 severity: None,
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         let findings = unit_findings(
             r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
@@ -3577,7 +3835,10 @@ mod tests {
                 severity: Some("error".to_string()),
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         let findings = unit_findings(
             r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
@@ -3729,13 +3990,9 @@ mod tests {
     fn json_report_lists_parser_limitations_apart_from_findings() {
         let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
         let limitations = vec!["failed to parse Rust source broken.rs:1:8".to_string()];
-        let output = render_findings_with_limitations(
-            &findings,
-            AuditOutputFormat::Json,
-            &limitations,
-            1,
-        )
-        .unwrap();
+        let output =
+            render_findings_with_limitations(&findings, AuditOutputFormat::Json, &limitations, 1)
+                .unwrap();
         let report: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(report["summary"]["finding_count"], findings.len());
         assert_eq!(report["findings"].as_array().unwrap().len(), findings.len());
@@ -4096,18 +4353,34 @@ mod tests {
         let colored = renderer.render_text_colored(true);
         let plain = renderer.render_text_colored(false);
 
-        assert!(colored.contains("\x1b["), "colored text must contain ANSI escape codes");
-        assert!(!plain.contains("\x1b["), "plain text must not contain ANSI escape codes");
+        assert!(
+            colored.contains("\x1b["),
+            "colored text must contain ANSI escape codes"
+        );
+        assert!(
+            !plain.contains("\x1b["),
+            "plain text must not contain ANSI escape codes"
+        );
 
         let summary_colored = renderer.render_text_summary_colored(true);
         let summary_plain = renderer.render_text_summary_colored(false);
 
-        assert!(summary_colored.contains("\x1b["), "colored summary must contain ANSI escape codes");
-        assert!(!summary_plain.contains("\x1b["), "plain summary must not contain ANSI escape codes");
+        assert!(
+            summary_colored.contains("\x1b["),
+            "colored summary must contain ANSI escape codes"
+        );
+        assert!(
+            !summary_plain.contains("\x1b["),
+            "plain summary must not contain ANSI escape codes"
+        );
 
         let empty_renderer = DiagnosticRenderer::new(&[]);
-        assert!(empty_renderer.render_text_summary_colored(true).contains("\x1b["));
-        assert!(!empty_renderer.render_text_summary_colored(false).contains("\x1b["));
+        assert!(empty_renderer
+            .render_text_summary_colored(true)
+            .contains("\x1b["));
+        assert!(!empty_renderer
+            .render_text_summary_colored(false)
+            .contains("\x1b["));
     }
 
     #[test]
@@ -4137,18 +4410,32 @@ mod tests {
 
         // "hello!" is 6. Total = 36. At width 35, it wraps!
         let one_over = wrap_finding_message(prefix, "hello!", Some(35));
-        assert_eq!(one_over.lines().count(), 2, "one over must wrap: {one_over}");
+        assert_eq!(
+            one_over.lines().count(),
+            2,
+            "one over must wrap: {one_over}"
+        );
 
         // Unbreakable token longer than width is not split
         let long_token = "verylongunbreakabletokenlongerthanwidth";
         let wrapped_token = wrap_finding_message(prefix, long_token, Some(25));
-        assert!(wrapped_token.contains(long_token), "token must not be split: {wrapped_token}");
+        assert!(
+            wrapped_token.contains(long_token),
+            "token must not be split: {wrapped_token}"
+        );
 
         // Width smaller than prefix
         let small_width = wrap_finding_message(prefix, "a b c", Some(20));
         let lines: Vec<_> = small_width.lines().collect();
-        assert_eq!(lines[0], prefix.trim_end(), "prefix must remain intact on line 1");
-        assert!(lines[1].starts_with("    "), "continuation line must be indented");
+        assert_eq!(
+            lines[0],
+            prefix.trim_end(),
+            "prefix must remain intact on line 1"
+        );
+        assert!(
+            lines[1].starts_with("    "),
+            "continuation line must be indented"
+        );
 
         // Colored prefix wraps at identical word boundaries
         let colored_prefix = "\x1b[1msrc/lib.rs:1:\x1b[0m \x1b[1;33m[warning]\x1b[0m rule: ";
@@ -4184,7 +4471,11 @@ mod tests {
                 rule.id
             );
             for lim in rule.limitations {
-                assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
+                assert!(
+                    !lim.trim().is_empty(),
+                    "rule {} has empty limitation string",
+                    rule.id
+                );
             }
         }
     }

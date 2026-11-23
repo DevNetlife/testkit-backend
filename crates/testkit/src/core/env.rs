@@ -499,7 +499,9 @@ impl<F: TestFixture> FixtureBuilder<F> {
 
         if let Some(ci) = self.close_interval_secs {
             if ci == 0 {
-                return Err(TestkitError::misuse("ledger close interval must be greater than zero"));
+                return Err(TestkitError::misuse(
+                    "ledger close interval must be greater than zero",
+                ));
             }
             env.set_close_interval_override(ci);
         }
@@ -507,7 +509,9 @@ impl<F: TestFixture> FixtureBuilder<F> {
         for label in self.labels {
             let trimmed = label.trim();
             if trimmed.is_empty() {
-                return Err(TestkitError::misuse("address label cannot be empty or whitespace-only"));
+                return Err(TestkitError::misuse(
+                    "address label cannot be empty or whitespace-only",
+                ));
             }
             env.address_with_label(trimmed);
         }
@@ -1348,7 +1352,10 @@ impl TestEnv {
     /// assert!(report.contains("env_seed: 123"));
     /// ```
     pub fn failure_report(&self, failure_detail: &str) -> String {
-        format!("{failure_detail}\n\n{}", self.metadata().to_failure_report())
+        format!(
+            "{failure_detail}\n\n{}",
+            self.metadata().to_failure_report()
+        )
     }
 
     /// Create a [`FixtureBuilder`] configured to construct a `TestEnv`.
@@ -1456,7 +1463,8 @@ impl TestEnv {
     /// assert_eq!(env.generator_position(), 10);
     /// ```
     pub fn reset_generator_to(&self, position: u64) {
-        self.try_reset_generator_to(position).unwrap_or_else(|e| panic!("{e}"))
+        self.try_reset_generator_to(position)
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Assert that this environment and another environment are completely independent instances.

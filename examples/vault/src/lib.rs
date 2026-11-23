@@ -240,8 +240,6 @@ impl Treasury {
         from.require_auth();
         // In a real contract this would transfer a token; here we just
         // record the payout so tests can observe it.
-        env.storage()
-            .persistent()
-            .set(&(from, recipient), &amount);
+        env.storage().persistent().set(&(from, recipient), &amount);
     }
 }

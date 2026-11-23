@@ -82,8 +82,16 @@ pub fn run(args: ReleaseVerifyArgs) -> Result<(), CliError> {
     for crate_rel in PUBLISHED_CRATES {
         let manifest_path = workspace.join(crate_rel).join("Cargo.toml");
         let manifest_text = read_file(&manifest_path, crate_rel)?;
-        findings.extend(check_crate_version(crate_rel, &manifest_text, &workspace_version));
-        findings.extend(check_crate_inherits(crate_rel, &manifest_text, "repository"));
+        findings.extend(check_crate_version(
+            crate_rel,
+            &manifest_text,
+            &workspace_version,
+        ));
+        findings.extend(check_crate_inherits(
+            crate_rel,
+            &manifest_text,
+            "repository",
+        ));
         findings.extend(check_crate_inherits(crate_rel, &manifest_text, "license"));
     }
 
@@ -94,7 +102,10 @@ pub fn run(args: ReleaseVerifyArgs) -> Result<(), CliError> {
     // 4. CHANGELOG has a section for this version.
     let changelog_path = workspace.join("CHANGELOG.md");
     let changelog_text = read_file(&changelog_path, "CHANGELOG.md")?;
-    findings.extend(check_changelog_has_version(&changelog_text, &workspace_version));
+    findings.extend(check_changelog_has_version(
+        &changelog_text,
+        &workspace_version,
+    ));
 
     // 5. COMPATIBILITY.md mentions the pinned soroban-sdk version.
     let sdk_pin = extract_sdk_pin(&workspace_text)?;
@@ -274,7 +285,10 @@ fn check_workspace_field_set(manifest: &str, field: &str) -> Vec<Finding> {
 /// Check that `CHANGELOG.md` has a `## [<version>]` heading.
 fn check_changelog_has_version(changelog: &str, version: &str) -> Vec<Finding> {
     let heading = format!("## [{version}]");
-    if changelog.lines().any(|line| line.trim() == heading || line.trim().starts_with(&heading)) {
+    if changelog
+        .lines()
+        .any(|line| line.trim() == heading || line.trim().starts_with(&heading))
+    {
         return Vec::new();
     }
     vec![format!(
@@ -402,10 +416,8 @@ soroban-sdk = { version = \"27.0.6\", features = [\"testutils\"] }
 
     #[test]
     fn workspace_field_set_fails_when_absent() {
-        let findings = check_workspace_field_set(
-            "[workspace.package]\nversion = \"0.1.0\"\n",
-            "repository",
-        );
+        let findings =
+            check_workspace_field_set("[workspace.package]\nversion = \"0.1.0\"\n", "repository");
         assert_eq!(findings.len(), 1);
     }
 

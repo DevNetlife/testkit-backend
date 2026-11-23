@@ -624,7 +624,8 @@ impl TestEnv {
     /// assert_eq!(env.now(), before + advanced);
     /// ```
     pub fn advance_to_next_close(&self) -> u64 {
-        self.try_advance_to_next_close().unwrap_or_else(|e| panic!("{}", e))
+        self.try_advance_to_next_close()
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Attempt to advance the ledger clock to the next close time.

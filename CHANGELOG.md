@@ -30,6 +30,8 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- `TestEnv::expire_contract_instance(&contract)` advances the ledger just past one
+  contract's instance TTL, leaving entries with more headroom live.
 - `audit --format json` lists inputs the scanner could not read or parse under
   `summary.parser_limitations`, separate from `findings`. `finding_count` is
   unchanged, and the stderr parse warnings are still printed.

@@ -86,9 +86,7 @@ pub fn assert_rounding(a: i128, b: i128, actual: i128, policy: RoundingPolicy) {
     let expected = policy.apply(a, b).unwrap_or_else(|| {
         panic!(
             "{}",
-            TestkitError::AssertionFailed(format!(
-                "assert_rounding({a}, {b}): divisor is zero"
-            ))
+            TestkitError::AssertionFailed(format!("assert_rounding({a}, {b}): divisor is zero"))
         )
     });
     if actual != expected {

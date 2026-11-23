@@ -3,7 +3,7 @@
 //! Verifies that `TestkitError` context carries operation and contract details
 //! while preserving source error chains, machine-readable codes, and snapshot stability.
 
-use soroban_testkit::core::TestkitError;
+use soroban_testkit::core::{TestEnv, TestkitError};
 use std::error::Error as _;
 
 #[test]
@@ -238,9 +238,10 @@ fn failure_report_contains_deterministic_metadata() {
     assert!(env_report.contains("assertion failed: invalid invariant"));
     assert!(env_report.contains("env_seed: 42"));
 
-    let err = TestkitError::assertion_failed("unauthorized caller")
-        .with_env_metadata(&meta);
-    assert!(err.to_string().contains("environment metadata: [timestamp=0, sequence=0, seed=42]"));
+    let err = TestkitError::assertion_failed("unauthorized caller").with_env_metadata(&meta);
+    assert!(err
+        .to_string()
+        .contains("environment metadata: [timestamp=0, sequence=0, seed=42]"));
 
     let err_report = err.to_failure_report(&meta);
     assert!(err_report.contains("unauthorized caller"));
@@ -253,7 +254,7 @@ fn failure_report_contains_deterministic_metadata() {
 fn fixture_builder_constructs_configured_environment() {
     use soroban_testkit::core::{FixtureBuilder, TestEnv, TestFixture};
 
-    let env: TestEnv = FixtureBuilder::new()
+    let env: TestEnv = FixtureBuilder::<TestEnv>::new()
         .seed(77)
         .timestamp(500_000)
         .sequence_number(1234)
@@ -283,18 +284,24 @@ fn fixture_builder_rejects_invalid_configurations() {
     use soroban_testkit::core::FixtureBuilder;
 
     // Zero close interval is invalid
-    let err_interval = FixtureBuilder::new()
+    let err_interval = FixtureBuilder::<TestEnv>::new()
         .close_interval(0)
         .try_build();
     assert!(err_interval.is_err());
-    assert!(err_interval.unwrap_err().is_misuse());
+    assert!(match err_interval {
+        Err(error) => error.is_misuse(),
+        Ok(_) => false,
+    });
 
     // Empty or whitespace label is invalid
-    let err_label = FixtureBuilder::new()
+    let err_label = FixtureBuilder::<TestEnv>::new()
         .with_account_label("   ")
         .try_build();
     assert!(err_label.is_err());
-    assert!(err_label.unwrap_err().is_misuse());
+    assert!(match err_label {
+        Err(error) => error.is_misuse(),
+        Ok(_) => false,
+    });
 }
 
 // ── Issue #394: Explicit reset semantics for seeded generators ──
