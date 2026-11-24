@@ -30,6 +30,11 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- `MatrixReport::to_markdown` and `markdown_report` render deterministic Markdown tables for CI and documentation.
+- `auth::unauthorized_callers` generates fresh callers for property-based authorization tests.
+- Added cookbook guidance for multisig-like roles and a documented async-adapter assessment.
+
+
 - `AuthMatrix::report` runs the matrix in report-only mode: it returns a
   `MatrixReport` of per-cell `CellResult`s (entry point, caller, role,
   allowed, expected error, observed `CellOutcome`) instead of panicking.

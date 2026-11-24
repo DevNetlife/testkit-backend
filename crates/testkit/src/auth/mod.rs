@@ -30,5 +30,5 @@
 mod fixtures;
 mod matrix;
 
-pub use fixtures::{AdminUserActors, OwnerActors, PeerActors, RbacActors};
+pub use fixtures::{unauthorized_callers, AdminUserActors, OwnerActors, PeerActors, RbacActors};
 pub use matrix::{AuthMatrix, CellOutcome, CellResult, MatrixReport};

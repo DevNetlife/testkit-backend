@@ -619,6 +619,27 @@ impl PeerActors {
     }
 }
 
+
+/// Generate deterministic unauthorized callers for property-based auth tests.
+///
+/// The returned addresses are freshly generated from env and are guaranteed
+/// not to occur in allowed. This helper is useful for feeding a property
+/// test's unauthorized branch without accidentally selecting a valid actor.
+pub fn unauthorized_callers(
+    env: &TestEnv,
+    allowed: &[Address],
+    count: usize,
+) -> Vec<Address> {
+    let mut callers = Vec::with_capacity(count);
+    while callers.len() < count {
+        let candidate = env.address();
+        if !allowed.contains(&candidate) && !callers.contains(&candidate) {
+            callers.push(candidate);
+        }
+    }
+    callers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
