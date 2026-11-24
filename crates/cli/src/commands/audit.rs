@@ -205,6 +205,15 @@ enum AuditCommand {
     Rules,
     /// Output JSON schema for machine-readable audit reports.
     Schema,
+    /// Refresh a finding baseline JSON file from the current audit findings.
+    RefreshBaseline {
+        /// Path to the baseline JSON file to create or update.
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Path to the baseline JSON file to create or update.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Machine- and human-readable audit output formats.
@@ -370,12 +379,19 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
-    match &args.command {
+    let refresh_baseline_target = match &args.command {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
         Some(AuditCommand::Rules) => return list_rules(args.format),
         Some(AuditCommand::Schema) => return output_schema(),
-        None => {}
-    }
+        Some(AuditCommand::RefreshBaseline { file, output }) => Some(
+            output
+                .clone()
+                .or_else(|| file.clone())
+                .or_else(|| args.baseline.clone())
+                .unwrap_or_else(|| PathBuf::from(".soroban-testkit-baseline.json")),
+        ),
+        None => None,
+    };
 
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
@@ -426,7 +442,11 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         )?
     };
 
-    if !stdin && (!args.include.is_empty() || !args.exclude.is_empty()) && sources.is_empty() {
+    if refresh_baseline_target.is_none()
+        && !stdin
+        && (!args.include.is_empty() || !args.exclude.is_empty())
+        && sources.is_empty()
+    {
         match args.format {
             AuditOutputFormat::Text => {
                 println!("audit: no files matched the configured include/exclude filters");
@@ -482,8 +502,14 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let mut baseline = load_baseline(&args.baseline)?;
-    normalize_baseline_entries(&mut baseline, &workspace)?;
+    let mut baseline = if refresh_baseline_target.is_some() {
+        Vec::new()
+    } else {
+        let mut loaded = load_baseline(&args.baseline)?;
+        normalize_baseline_entries(&mut loaded, &workspace)?;
+        loaded
+    };
+    let _ = &mut baseline;
     let mut findings = Vec::new();
 
     if stdin {
@@ -520,6 +546,35 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     // Paths are final now, so this is the ordering every rendered report
     // is guaranteed to follow.
     normalize_findings(&mut findings);
+
+    if let Some(target) = refresh_baseline_target {
+        if !parse_warnings.is_empty() {
+            for warning in &parse_warnings {
+                eprintln!("audit: warning: {warning}");
+            }
+            return Err(CliError(format!(
+                "cannot refresh baseline {}: {} parse warning(s); fix the reported inputs and re-run",
+                target.display(),
+                parse_warnings.len()
+            )));
+        }
+        let entries = write_baseline_file(&target, &findings)?;
+        if args.format == AuditOutputFormat::Json {
+            let report = serde_json::json!({
+                "baseline": target.to_string_lossy(),
+                "entry_count": entries.len(),
+            });
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        } else {
+            let noun = if entries.len() == 1 { "entry" } else { "entries" };
+            println!(
+                "audit: refreshed baseline {} ({} {noun})",
+                target.display(),
+                entries.len()
+            );
+        }
+        return Ok(());
+    }
 
     let width = resolve_width(&args.width, &config)?;
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
@@ -2273,6 +2328,55 @@ fn normalize_baseline_entries(
         entry.file = normalized.to_string_lossy().into_owned();
     }
     Ok(())
+}
+
+/// Converts normalized findings into deduplicated baseline entries.
+fn build_baseline_entries(findings: &[Finding]) -> Vec<BaselineEntry> {
+    let mut entries: Vec<BaselineEntry> = findings
+        .iter()
+        .map(|finding| BaselineEntry {
+            file: finding.file.to_string_lossy().into_owned(),
+            line: finding.line,
+            rule: finding.rule.to_string(),
+        })
+        .collect();
+    entries.dedup();
+    entries
+}
+
+/// Writes a finding baseline JSON file to `target`, creating parent directories
+/// if needed and returning the written entries.
+fn write_baseline_file(target: &Path, findings: &[Finding]) -> Result<Vec<BaselineEntry>, CliError> {
+    if target.is_dir() {
+        return Err(CliError(format!(
+            "baseline path {} is a directory; pass a file path such as baseline.json",
+            target.display()
+        )));
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| {
+                CliError(format!(
+                    "failed to create parent directory for baseline {}: {err}; check path permissions",
+                    target.display()
+                ))
+            })?;
+        }
+    }
+    let entries = build_baseline_entries(findings);
+    let json = serde_json::to_string_pretty(&entries).map_err(|err| {
+        CliError(format!(
+            "failed to serialize baseline {}: {err}",
+            target.display()
+        ))
+    })?;
+    fs::write(target, format!("{json}\n")).map_err(|err| {
+        CliError(format!(
+            "failed to write baseline file {}: {err}; check path permissions",
+            target.display()
+        ))
+    })?;
+    Ok(entries)
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
@@ -5186,5 +5290,45 @@ mod tests {
             failed_report["runs"][0]["invocations"][0]["properties"]["skippedFileCount"],
             1
         );
+    }
+
+    #[test]
+    fn build_baseline_entries_deduplicates_same_file_line_and_rule() {
+        let mut findings = vec![
+            sample_finding("src/lib.rs", 4, "unchecked-i128-arithmetic", "msg 1"),
+            sample_finding("src/lib.rs", 4, "unchecked-i128-arithmetic", "msg 2"),
+            sample_finding("src/lib.rs", 10, "missing-require-auth", "msg 3"),
+        ];
+        normalize_findings(&mut findings);
+        let entries = build_baseline_entries(&findings);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].file, "src/lib.rs");
+        assert_eq!(entries[0].line, 4);
+        assert_eq!(entries[0].rule, "unchecked-i128-arithmetic");
+        assert_eq!(entries[1].line, 10);
+    }
+
+    #[test]
+    fn write_baseline_file_writes_valid_json_and_rejects_directory() {
+        let root = std::env::temp_dir().join(format!("stk-baseline-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dir_err = write_baseline_file(&root, &[]).unwrap_err();
+        assert!(dir_err.0.contains("is a directory"), "{}", dir_err.0);
+
+        let target = root.join("nested/baseline.json");
+        let findings = vec![sample_finding(
+            "crates/vault/src/lib.rs",
+            3,
+            "missing-require-auth",
+            "missing auth",
+        )];
+        let written = write_baseline_file(&target, &findings).unwrap();
+        assert_eq!(written.len(), 1);
+        let loaded = load_baseline(&Some(target.clone())).unwrap();
+        assert_eq!(loaded, written);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

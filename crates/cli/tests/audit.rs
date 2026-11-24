@@ -2323,6 +2323,71 @@ fn audit_sarif_includes_tool_version_and_invocation_metadata() {
 }
 
 #[test]
+fn audit_refresh_baseline_creates_updates_and_validates_target() {
+    let fixture = AuditFixture::new("refresh-baseline");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let create = run_from(&fixture.0, &["audit", "refresh-baseline", "baseline.json"]);
+    assert!(create.status.success(), "{create:?}");
+    let stdout = String::from_utf8_lossy(&create.stdout);
+    assert!(stdout.contains("refreshed baseline"), "{stdout}");
+    assert!(stdout.contains("1 entry"), "{stdout}");
+
+    // Using the freshly generated baseline should suppress the existing finding.
+    let clean = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(clean.status.success(), "{clean:?}");
+
+    // Add a second finding; --strict fails until we refresh the baseline.
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = amount + 1;
+    }
+}
+"#,
+    );
+    let dirty = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(!dirty.status.success());
+
+    let refresh = run_from(
+        &fixture.0,
+        &[
+            "audit",
+            "refresh-baseline",
+            "--output",
+            "baseline.json",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(refresh.status.success(), "{refresh:?}");
+    let refresh_json: serde_json::Value = serde_json::from_slice(&refresh.stdout).unwrap();
+    assert!(refresh_json["entry_count"].as_u64().unwrap() >= 2);
+
+    let clean_after_refresh = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(clean_after_refresh.status.success(), "{clean_after_refresh:?}");
+
+    // Passing a directory as the baseline target must fail actionably.
+    let dir_fail = run_from(&fixture.0, &["audit", "refresh-baseline", "crates"]);
+    assert!(!dir_fail.status.success());
+    let dir_err = String::from_utf8_lossy(&dir_fail.stderr);
+    assert!(dir_err.contains("is a directory"), "{dir_err}");
+
+    // Parse errors must refuse to overwrite the baseline.
+    let before = std::fs::read_to_string(fixture.0.join("baseline.json")).unwrap();
+    fixture.write("crates/vault/src/broken.rs", "fn broken( {\n");
+    let parse_fail = run_from(&fixture.0, &["audit", "refresh-baseline", "baseline.json"]);
+    assert!(!parse_fail.status.success());
+    let parse_err = String::from_utf8_lossy(&parse_fail.stderr);
+    assert!(parse_err.contains("cannot refresh baseline"), "{parse_err}");
+    let after = std::fs::read_to_string(fixture.0.join("baseline.json")).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn audit_allow_comment_via_new_syntax_works() {
     // Test the shorter audit:allow(<rule>) syntax (not requiring soroban_testkit prefix)
     let source = br#"
