@@ -17,6 +17,26 @@
 //! Mixing them up is the classic off-by-`10^7` bug, so each method states its
 //! unit in its own docs and in its failure messages.
 //!
+//! # Whole-unit balances: truncating and exact
+//!
+//! [`TestToken::balance_whole`] truncates, so a balance of `1.5` units reads as
+//! `1`. [`TestToken::balance_whole_exact`] (and the non-panicking
+//! [`TestToken::try_balance_whole_exact`]) refuse instead, naming the stray
+//! base units, which is what a test that expects a round balance wants.
+//! [`base_to_whole_units_exact`] is the same check on a bare amount.
+//!
+//! # Holders, metadata and several tokens
+//!
+//! - [`TestToken::tracked_holders`] lists every address the double has minted
+//!   to, in first-mint order; [`TestToken::tracked_balances`] and
+//!   [`TestToken::snapshot_tracked`] read their current balances.
+//! - [`TokenMetadata`] gives a token a display name and symbol
+//!   ([`TestEnv::token_with_metadata`](crate::core::TestEnv::token_with_metadata),
+//!   [`TestToken::set_metadata`]) so [`TestToken::format_amount`] can print
+//!   `1.5 USDC`. It is a label held by the double, **not** on-chain metadata.
+//! - [`TokenSet`] deploys several labelled tokens at once
+//!   ([`TestEnv::token_set`](crate::core::TestEnv::token_set)).
+//!
 //! # Administrative authorization
 //!
 //! [`TestToken`] deploys a real Stellar Asset Contract with a fresh test
@@ -31,4 +51,7 @@
 
 mod sac;
 
-pub use sac::{base_to_whole_units, whole_to_base_units, TestToken};
+pub use sac::{
+    base_to_whole_units, base_to_whole_units_exact, whole_to_base_units, BalanceDeltaAllocation,
+    MintAllocation, TestToken, TokenDiff, TokenMetadata, TokenSet, TokenSnapshot,
+};

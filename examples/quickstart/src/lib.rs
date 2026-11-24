@@ -271,7 +271,10 @@ mod tests {
     ) -> Result<(), soroban_sdk::Error> {
         match r {
             Ok(Ok(_)) => Ok(()),
-            _ => Err(soroban_sdk::Error::from_contract_error(0)),
+            _ => Err(soroban_sdk::Error::from((
+                soroban_sdk::xdr::ScErrorType::Auth,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ))),
         }
     }
 

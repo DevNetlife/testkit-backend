@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_assignments, clippy::all)]
+
 mod commands;
 
 use clap::Parser;

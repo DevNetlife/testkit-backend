@@ -8,6 +8,12 @@
 //! restated in the failure report so the coverage it implies is never
 //! ambiguous.
 //!
+//! [`AuthMatrix::assert_enforced`] panics on the first run that has any
+//! violating cell; [`AuthMatrix::report`] runs the same cells in report-only
+//! mode and returns a [`MatrixReport`] of [`CellResult`]s instead. Every cell
+//! runs with isolated authorization state, and results are always ordered by
+//! entry-point registration, then known-actor first-seen order.
+//!
 //! # Named actor fixtures
 //!
 //! For the handful of role shapes that appear in nearly every contract,
@@ -24,5 +30,5 @@
 mod fixtures;
 mod matrix;
 
-pub use fixtures::{AdminUserActors, OwnerActors, PeerActors, RbacActors};
-pub use matrix::AuthMatrix;
+pub use fixtures::{unauthorized_callers, AdminUserActors, OwnerActors, PeerActors, RbacActors};
+pub use matrix::{AuthMatrix, CellOutcome, CellResult, MatrixReport};

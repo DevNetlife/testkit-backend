@@ -10,7 +10,7 @@ Please report security issues privately via GitHub's
 ["Report a vulnerability"](../../security/advisories/new) feature on this
 repository rather than opening a public issue. Include:
 
-- The affected module or CLI command
+- The affected module or CLI command.
 - A minimal reproduction
 - The impact you believe it has (e.g. `audit` missing a real bug,
   `AuthMatrix` reporting a false pass)

@@ -317,6 +317,15 @@ pub struct TestEnv {
     labels: Mutex<LabelStore>,
 }
 
+impl std::fmt::Debug for TestEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestEnv")
+            .field("seed", &self.seed)
+            .field("close_interval_secs", &self.close_interval_secs)
+            .finish()
+    }
+}
+
 /// Reusable test setup built around a [`TestEnv`].
 ///
 /// Implement this trait for a fixture struct that owns a `TestEnv` plus the

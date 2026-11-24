@@ -3,7 +3,7 @@
 //! Verifies that `TestkitError` context carries operation and contract details
 //! while preserving source error chains, machine-readable codes, and snapshot stability.
 
-use soroban_testkit::core::{TestEnv, TestkitError};
+use soroban_testkit::core::TestkitError;
 use std::error::Error as _;
 
 #[test]
@@ -281,27 +281,21 @@ fn fixture_builder_constructs_configured_environment() {
 
 #[test]
 fn fixture_builder_rejects_invalid_configurations() {
-    use soroban_testkit::core::FixtureBuilder;
+    use soroban_testkit::core::{FixtureBuilder, TestEnv};
 
     // Zero close interval is invalid
     let err_interval = FixtureBuilder::<TestEnv>::new()
         .close_interval(0)
         .try_build();
     assert!(err_interval.is_err());
-    assert!(match err_interval {
-        Err(error) => error.is_misuse(),
-        Ok(_) => false,
-    });
+    assert!(err_interval.err().unwrap().is_misuse());
 
     // Empty or whitespace label is invalid
     let err_label = FixtureBuilder::<TestEnv>::new()
         .with_account_label("   ")
         .try_build();
     assert!(err_label.is_err());
-    assert!(match err_label {
-        Err(error) => error.is_misuse(),
-        Ok(_) => false,
-    });
+    assert!(err_label.err().unwrap().is_misuse());
 }
 
 // ── Issue #394: Explicit reset semantics for seeded generators ──

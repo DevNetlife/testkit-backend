@@ -112,12 +112,18 @@ fn auth_state_is_reset_between_independent_actor_cases() {
                     .try_privileged(caller)
                 {
                     Ok(Ok(())) => Ok(()),
-                    _ => Err(soroban_sdk::Error::from_contract_error(1)),
+                    _ => Err(soroban_sdk::Error::from((
+                        soroban_sdk::xdr::ScErrorType::Auth,
+                        soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                    ))),
                 }
             } else {
                 match client.try_privileged(caller) {
                     Ok(Ok(())) => Ok(()),
-                    _ => Err(soroban_sdk::Error::from_contract_error(1)),
+                    _ => Err(soroban_sdk::Error::from((
+                        soroban_sdk::xdr::ScErrorType::Auth,
+                        soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                    ))),
                 }
             }
         },
@@ -180,7 +186,10 @@ fn owner_actors_enforced_owner_only_matrix_passes() {
             if *caller == owner {
                 Ok(())
             } else {
-                Err(soroban_sdk::Error::from_contract_error(1))
+                Err(soroban_sdk::Error::from((
+                    soroban_sdk::xdr::ScErrorType::Auth,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                )))
             }
         })
         .assert_enforced();
@@ -220,7 +229,7 @@ fn owner_actors_enforced_catches_missing_auth_on_guarded_entry_point() {
 fn owner_actors_allowed_slice_is_only_owner() {
     let env = TestEnv::new();
     let fx = OwnerActors::new(&env);
-    assert_eq!(fx.allowed(), &[fx.owner.clone()]);
+    assert_eq!(fx.allowed(), std::slice::from_ref(&fx.owner));
     assert!(!fx.allowed().contains(&fx.attacker));
 }
 
@@ -239,14 +248,20 @@ fn admin_user_actors_enforced_two_tier_matrix_passes() {
             if *caller == admin {
                 Ok(())
             } else {
-                Err(soroban_sdk::Error::from_contract_error(1))
+                Err(soroban_sdk::Error::from((
+                    soroban_sdk::xdr::ScErrorType::Auth,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                )))
             }
         })
         .entry_point("user_op", fx.admin_and_user().as_slice(), move |caller| {
             if *caller == admin2 || *caller == user_addr {
                 Ok(())
             } else {
-                Err(soroban_sdk::Error::from_contract_error(1))
+                Err(soroban_sdk::Error::from((
+                    soroban_sdk::xdr::ScErrorType::Auth,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                )))
             }
         })
         .assert_enforced();
@@ -305,7 +320,10 @@ fn rbac_actors_enforced_three_tier_matrix_passes() {
             if *caller == admin {
                 Ok(())
             } else {
-                Err(soroban_sdk::Error::from_contract_error(1))
+                Err(soroban_sdk::Error::from((
+                    soroban_sdk::xdr::ScErrorType::Auth,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                )))
             }
         })
         .entry_point(
@@ -315,7 +333,10 @@ fn rbac_actors_enforced_three_tier_matrix_passes() {
                 if *caller == admin2 || *caller == operator {
                     Ok(())
                 } else {
-                    Err(soroban_sdk::Error::from_contract_error(1))
+                    Err(soroban_sdk::Error::from((
+                        soroban_sdk::xdr::ScErrorType::Auth,
+                        soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                    )))
                 }
             },
         )
@@ -323,7 +344,10 @@ fn rbac_actors_enforced_three_tier_matrix_passes() {
             if *caller == admin3 || *caller == operator2 || *caller == viewer {
                 Ok(())
             } else {
-                Err(soroban_sdk::Error::from_contract_error(1))
+                Err(soroban_sdk::Error::from((
+                    soroban_sdk::xdr::ScErrorType::Auth,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                )))
             }
         })
         .assert_enforced();
@@ -337,7 +361,10 @@ fn rbac_actors_enforced_catches_viewer_escalating_to_operator() {
     // Bug: operate lets all three roles through (viewer should not be allowed).
     let matrix = AuthMatrix::new(&env)
         .entry_point("configure", fx.admin_only(), |_| {
-            Err(soroban_sdk::Error::from_contract_error(1))
+            Err(soroban_sdk::Error::from((
+                soroban_sdk::xdr::ScErrorType::Auth,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            )))
         })
         .entry_point("operate", fx.all_roles().as_slice(), |_| Ok(()));
 
@@ -376,7 +403,10 @@ fn peer_actors_enforced_symmetric_access_passes() {
             if peers_clone.contains(caller) {
                 Ok(())
             } else {
-                Err(soroban_sdk::Error::from_contract_error(1))
+                Err(soroban_sdk::Error::from((
+                    soroban_sdk::xdr::ScErrorType::Auth,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                )))
             }
         })
         .assert_enforced();

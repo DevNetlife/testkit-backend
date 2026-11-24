@@ -316,3 +316,14 @@ add validation coverage for the batch payout auth model
 add a line-count and coverage comparison to validation
 
 add benchmark tracking for TestEnv construction
+
+## Nested sub-invoke authorization
+
+A top-level authorization assertion does not automatically authorize the contract calls it triggers. When an entry point invokes another contract, register the nested invocation in the mocked authorization tree as well:
+
+1. Add a `MockAuthInvoke` for the top-level call.
+2. Add each nested contract, function name, argument tuple, and its own `sub_invokes` list.
+3. Assert the complete tree for both the permitted and denied actor cells.
+4. Reset mocked authorizations between matrix cells so one successful invocation cannot satisfy a later nested call.
+
+For escrow streams and recurring contracts, keep the payer, recipient, operator, scheduler, and beneficiary addresses as named actors in the matrix. Then use `AuthMatrix::denied_addresses` to verify that every role excluded from a privileged entry point is still exercised. This catches a common false positive where the outer call is authorized while a nested transfer or schedule update is not.
