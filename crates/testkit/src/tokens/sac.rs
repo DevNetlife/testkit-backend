@@ -1991,7 +1991,10 @@ impl TokenSet {
     /// assert_eq!(tokens.labels(), vec!["USDC", "EURC"]);
     /// ```
     pub fn labels(&self) -> Vec<&str> {
-        self.tokens.iter().map(|(label, _)| label.as_str()).collect()
+        self.tokens
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect()
     }
 
     /// The token with `label`, if the set has one.
@@ -3025,10 +3028,7 @@ mod tests {
         let message = base_to_whole_units_exact(15_000_000, 7)
             .unwrap_err()
             .to_string();
-        assert!(
-            message.contains("not a whole number of units"),
-            "{message}"
-        );
+        assert!(message.contains("not a whole number of units"), "{message}");
         assert!(
             message.contains("1 whole units and 5000000 base units left over"),
             "{message}"
@@ -3090,7 +3090,10 @@ mod tests {
         let alice = env.address();
         token.mint_raw(&alice, 15_000_000);
 
-        let message = token.try_balance_whole_exact(&alice).unwrap_err().to_string();
+        let message = token
+            .try_balance_whole_exact(&alice)
+            .unwrap_err()
+            .to_string();
 
         assert!(message.contains("1.5 TEST"), "{message}");
         assert!(message.contains("15000000 base units"), "{message}");
@@ -3179,7 +3182,9 @@ mod tests {
     fn try_token_with_metadata_rejects_bad_input() {
         let env = TestEnv::new();
         assert!(env.try_token_with_metadata("Euro Coin", "EURC").is_ok());
-        assert!(env.try_token_with_metadata("Euro Coin", "no spaces").is_err());
+        assert!(env
+            .try_token_with_metadata("Euro Coin", "no spaces")
+            .is_err());
         assert!(env.try_token_with_metadata("", "EURC").is_err());
     }
 
@@ -3432,7 +3437,10 @@ mod tests {
         assert_eq!(tokens.token("USDC").symbol(), "USDC");
         assert_eq!(tokens.token("USDC").name(), "USDC");
         assert_eq!(tokens.token("EURC").symbol(), "EURC");
-        assert_ne!(tokens.token("USDC").address(), tokens.token("EURC").address());
+        assert_ne!(
+            tokens.token("USDC").address(),
+            tokens.token("EURC").address()
+        );
     }
 
     #[test]
@@ -3469,7 +3477,10 @@ mod tests {
             .or_else(|| payload.downcast_ref::<&str>().map(|m| m.to_string()))
             .unwrap_or_default();
         assert!(message.contains("known labels"), "{message}");
-        assert!(message.contains("USDC") && message.contains("EURC"), "{message}");
+        assert!(
+            message.contains("USDC") && message.contains("EURC"),
+            "{message}"
+        );
     }
 
     #[test]
