@@ -44,6 +44,24 @@ or add `// audit:allow_all` to suppress all findings on that line.
 Suppressions apply only to the line they precede and do not cascade.
 Use `// audit:allow(<rule_id>, \"reason for suppression\")` to document why.";
 
+/// Returns the canonical documentation URI for a SARIF rule descriptor.
+///
+/// Returns `None` when `rule_id` is empty or whitespace-only so callers never
+/// emit a broken anchor-only URI.
+fn sarif_rule_help_uri(rule_id: &str) -> Option<String> {
+    let trimmed = rule_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let repo = env!("CARGO_PKG_REPOSITORY").trim_end_matches('/');
+    let base = if repo.is_empty() {
+        "https://github.com/soroban-testkit/soroban-testkit"
+    } else {
+        repo
+    };
+    Some(format!("{base}/blob/main/docs/audit-rules.md#{trimmed}"))
+}
+
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
 /// machine-readable listing) route through this one function, so the
@@ -170,6 +188,10 @@ pub struct AuditArgs {
     /// include patterns.
     #[arg(long = "exclude", value_name = "GLOB_OR_DIR", action = clap::ArgAction::Append, global = true)]
     pub exclude: Vec<String>,
+    /// Run only the specified audit rule(s) by stable identifier (repeatable
+    /// or comma-separated). Use `soroban-testkit audit rules` to list valid IDs.
+    #[arg(long = "rule", value_name = "RULE_ID", value_delimiter = ',', action = clap::ArgAction::Append, global = true)]
+    pub rules: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -183,6 +205,15 @@ enum AuditCommand {
     Rules,
     /// Output JSON schema for machine-readable audit reports.
     Schema,
+    /// Refresh a finding baseline JSON file from the current audit findings.
+    RefreshBaseline {
+        /// Path to the baseline JSON file to create or update.
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Path to the baseline JSON file to create or update.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Machine- and human-readable audit output formats.
@@ -348,12 +379,19 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
-    match &args.command {
+    let refresh_baseline_target = match &args.command {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
         Some(AuditCommand::Rules) => return list_rules(args.format),
         Some(AuditCommand::Schema) => return output_schema(),
-        None => {}
-    }
+        Some(AuditCommand::RefreshBaseline { file, output }) => Some(
+            output
+                .clone()
+                .or_else(|| file.clone())
+                .or_else(|| args.baseline.clone())
+                .unwrap_or_else(|| PathBuf::from(".soroban-testkit-baseline.json")),
+        ),
+        None => None,
+    };
 
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
@@ -384,7 +422,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
     };
     let workspace = find_workspace_root(&source_dir);
-    let config = load_config(&source_dir, &workspace)?;
+    let mut config = load_config(&source_dir, &workspace)?;
+    apply_selected_rules(&args.rules, &mut config)?;
 
     let mut raw_exclusions = config.exclude.clone();
     raw_exclusions.extend(exclude_dirs);
@@ -403,7 +442,11 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         )?
     };
 
-    if !stdin && (!args.include.is_empty() || !args.exclude.is_empty()) && sources.is_empty() {
+    if refresh_baseline_target.is_none()
+        && !stdin
+        && (!args.include.is_empty() || !args.exclude.is_empty())
+        && sources.is_empty()
+    {
         match args.format {
             AuditOutputFormat::Text => {
                 println!("audit: no files matched the configured include/exclude filters");
@@ -430,7 +473,23 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
                     "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
                     "version": "2.1.0",
                     "runs": [{
-                        "tool": { "driver": { "name": "soroban-testkit", "rules": [] } },
+                        "tool": {
+                            "driver": {
+                                "name": "soroban-testkit",
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "semanticVersion": env!("CARGO_PKG_VERSION"),
+                                "informationUri": env!("CARGO_PKG_REPOSITORY"),
+                                "rules": []
+                            }
+                        },
+                        "invocations": [{
+                            "executionSuccessful": true,
+                            "properties": {
+                                "filesScanned": 0,
+                                "skippedFileCount": 0,
+                                "findingCount": 0
+                            }
+                        }],
                         "results": [],
                         "properties": {
                             "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
@@ -443,8 +502,14 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let mut baseline = load_baseline(&args.baseline)?;
-    normalize_baseline_entries(&mut baseline, &workspace)?;
+    let mut baseline = if refresh_baseline_target.is_some() {
+        Vec::new()
+    } else {
+        let mut loaded = load_baseline(&args.baseline)?;
+        normalize_baseline_entries(&mut loaded, &workspace)?;
+        loaded
+    };
+    let _ = &mut baseline;
     let mut findings = Vec::new();
 
     if stdin {
@@ -481,6 +546,35 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     // Paths are final now, so this is the ordering every rendered report
     // is guaranteed to follow.
     normalize_findings(&mut findings);
+
+    if let Some(target) = refresh_baseline_target {
+        if !parse_warnings.is_empty() {
+            for warning in &parse_warnings {
+                eprintln!("audit: warning: {warning}");
+            }
+            return Err(CliError(format!(
+                "cannot refresh baseline {}: {} parse warning(s); fix the reported inputs and re-run",
+                target.display(),
+                parse_warnings.len()
+            )));
+        }
+        let entries = write_baseline_file(&target, &findings)?;
+        if args.format == AuditOutputFormat::Json {
+            let report = serde_json::json!({
+                "baseline": target.to_string_lossy(),
+                "entry_count": entries.len(),
+            });
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        } else {
+            let noun = if entries.len() == 1 { "entry" } else { "entries" };
+            println!(
+                "audit: refreshed baseline {} ({} {noun})",
+                target.display(),
+                entries.len()
+            );
+        }
+        return Ok(());
+    }
 
     let width = resolve_width(&args.width, &config)?;
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
@@ -1456,6 +1550,14 @@ impl<'a> DiagnosticRenderer<'a> {
     /// `level` on its `results`. Region snippets are sanitized before
     /// embedding.
     pub fn render_sarif(&self) -> Result<String, CliError> {
+        self.render_sarif_with_invocation(0)
+    }
+
+    /// Render SARIF 2.1.0 output with invocation status and skipped-file metadata.
+    pub fn render_sarif_with_invocation(
+        &self,
+        skipped_file_count: usize,
+    ) -> Result<String, CliError> {
         let mut rule_ids: Vec<_> = self.findings.iter().map(|finding| finding.rule).collect();
         rule_ids.sort_unstable();
         rule_ids.dedup();
@@ -1484,6 +1586,9 @@ impl<'a> DiagnosticRenderer<'a> {
                 });
                 if let Some(desc) = description {
                     rule_obj["fullDescription"] = serde_json::json!({ "text": desc });
+                }
+                if let Some(help_uri) = sarif_rule_help_uri(rule) {
+                    rule_obj["helpUri"] = serde_json::Value::String(help_uri);
                 }
                 if let Some(severity) = effective_severity {
                     rule_obj["defaultConfiguration"] =
@@ -1531,7 +1636,23 @@ impl<'a> DiagnosticRenderer<'a> {
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "version": "2.1.0",
             "runs": [{
-                "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
+                "tool": {
+                    "driver": {
+                        "name": "soroban-testkit",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "semanticVersion": env!("CARGO_PKG_VERSION"),
+                        "informationUri": env!("CARGO_PKG_REPOSITORY"),
+                        "rules": rules
+                    }
+                },
+                "invocations": [{
+                    "executionSuccessful": skipped_file_count == 0,
+                    "properties": {
+                        "filesScanned": self.effective_files_scanned(),
+                        "skippedFileCount": skipped_file_count,
+                        "findingCount": self.findings.len()
+                    }
+                }],
                 "results": results,
                 "properties": { "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE] }
             }]
@@ -1579,6 +1700,7 @@ pub fn render_findings_with_limitations_and_scanned(
         AuditOutputFormat::Json => {
             renderer.render_json_with_limitations(parser_limitations, skipped_file_count)
         }
+        AuditOutputFormat::Sarif => renderer.render_sarif_with_invocation(skipped_file_count),
         _ => renderer.render(format),
     }
 }
@@ -1712,6 +1834,45 @@ pub const VALID_RULES: &[&str] = &[
     "unchecked-narrowing-conversion",
     "unchecked-timestamp-arithmetic",
 ];
+
+const EXTRA_SELECTABLE_RULES: &[&str] = &[
+    "inconsistent-validation-across-entry-points",
+    "zero-transfer-amount",
+    "arithmetic-before-range-check",
+];
+
+fn is_known_rule_id(rule_id: &str) -> bool {
+    VALID_RULES.contains(&rule_id) || EXTRA_SELECTABLE_RULES.contains(&rule_id)
+}
+
+/// Validates `--rule` selections and restricts `config.rules` to only the
+/// requested stable rule identifiers while preserving configured severities.
+fn apply_selected_rules(selected: &[String], config: &mut AuditConfig) -> Result<(), CliError> {
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let mut chosen = HashSet::new();
+    for raw in selected {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(CliError(
+                "rule identifier cannot be empty; run `soroban-testkit audit rules` to list valid rule identifiers"
+                    .to_string(),
+            ));
+        }
+        if !is_known_rule_id(trimmed) {
+            return Err(CliError(format!(
+                "unknown audit rule `{trimmed}`; run `soroban-testkit audit rules` to list valid rule identifiers"
+            )));
+        }
+        chosen.insert(trimmed.to_string());
+    }
+    for &rule_id in VALID_RULES.iter().chain(EXTRA_SELECTABLE_RULES.iter()) {
+        let entry = config.rules.entry(rule_id.to_string()).or_default();
+        entry.enabled = chosen.contains(rule_id);
+    }
+    Ok(())
+}
 
 pub const VALID_SEVERITIES: &[&str] = &["error", "warning", "note"];
 
@@ -2167,6 +2328,55 @@ fn normalize_baseline_entries(
         entry.file = normalized.to_string_lossy().into_owned();
     }
     Ok(())
+}
+
+/// Converts normalized findings into deduplicated baseline entries.
+fn build_baseline_entries(findings: &[Finding]) -> Vec<BaselineEntry> {
+    let mut entries: Vec<BaselineEntry> = findings
+        .iter()
+        .map(|finding| BaselineEntry {
+            file: finding.file.to_string_lossy().into_owned(),
+            line: finding.line,
+            rule: finding.rule.to_string(),
+        })
+        .collect();
+    entries.dedup();
+    entries
+}
+
+/// Writes a finding baseline JSON file to `target`, creating parent directories
+/// if needed and returning the written entries.
+fn write_baseline_file(target: &Path, findings: &[Finding]) -> Result<Vec<BaselineEntry>, CliError> {
+    if target.is_dir() {
+        return Err(CliError(format!(
+            "baseline path {} is a directory; pass a file path such as baseline.json",
+            target.display()
+        )));
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| {
+                CliError(format!(
+                    "failed to create parent directory for baseline {}: {err}; check path permissions",
+                    target.display()
+                ))
+            })?;
+        }
+    }
+    let entries = build_baseline_entries(findings);
+    let json = serde_json::to_string_pretty(&entries).map_err(|err| {
+        CliError(format!(
+            "failed to serialize baseline {}: {err}",
+            target.display()
+        ))
+    })?;
+    fs::write(target, format!("{json}\n")).map_err(|err| {
+        CliError(format!(
+            "failed to write baseline file {}: {err}; check path permissions",
+            target.display()
+        ))
+    })?;
+    Ok(entries)
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
@@ -4960,5 +5170,165 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("stale suppression"), "{}", err.0);
+    }
+
+    #[test]
+    fn sarif_rule_help_uri_builds_valid_anchors_and_rejects_empty_ids() {
+        assert_eq!(sarif_rule_help_uri(""), None);
+        assert_eq!(sarif_rule_help_uri("   "), None);
+        let uri = sarif_rule_help_uri("missing-require-auth").unwrap();
+        assert!(uri.starts_with("https://"), "{uri}");
+        assert!(uri.ends_with("#missing-require-auth"), "{uri}");
+    }
+
+    #[test]
+    fn sarif_output_includes_rule_help_uris() {
+        let findings = audit_source_for_test(
+            "pub fn deposit(from: Address, amount: i128) { let _ = amount + 1; }",
+        );
+        let sarif = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let rules = report["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert!(rules.len() >= 2, "{rules:?}");
+        let mut seen_uris = HashSet::new();
+        for rule in rules {
+            let id = rule["id"].as_str().unwrap();
+            let help_uri = rule["helpUri"].as_str().unwrap();
+            assert!(help_uri.starts_with("https://"), "{help_uri}");
+            assert!(help_uri.ends_with(&format!("#{id}")), "{help_uri}");
+            assert!(seen_uris.insert(help_uri.to_string()), "duplicate {help_uri}");
+        }
+    }
+
+    #[test]
+    fn apply_selected_rules_filters_to_requested_identifiers_and_preserves_severity() {
+        let mut config = AuditConfig::default();
+        config.rules.insert(
+            "missing-require-auth".to_string(),
+            RuleConfig {
+                enabled: false,
+                severity: Some("error".to_string()),
+            },
+        );
+        apply_selected_rules(&["missing-require-auth".to_string()], &mut config).unwrap();
+        assert!(config.rules["missing-require-auth"].enabled);
+        assert_eq!(
+            config.rules["missing-require-auth"].severity.as_deref(),
+            Some("error")
+        );
+        assert!(!config.rules["unchecked-i128-arithmetic"].enabled);
+
+        let mut findings = Vec::new();
+        audit_source(
+            Path::new("<test>"),
+            "pub fn withdraw(env: Env, from: Address, amount: i128) { let _ = amount + 1; }",
+            &mut findings,
+            &config,
+            "pub fn withdraw(env: Env, from: Address, amount: i128) { let _ = amount + 1; }",
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "missing-require-auth");
+        assert_eq!(findings[0].severity, "error");
+    }
+
+    #[test]
+    fn apply_selected_rules_rejects_empty_and_unknown_identifiers() {
+        let mut config = AuditConfig::default();
+        let empty_err = apply_selected_rules(&["".to_string()], &mut config).unwrap_err();
+        assert!(empty_err.0.contains("cannot be empty"), "{}", empty_err.0);
+
+        let unknown_err =
+            apply_selected_rules(&["not-a-real-rule".to_string()], &mut config).unwrap_err();
+        assert!(
+            unknown_err.0.contains("unknown audit rule `not-a-real-rule`"),
+            "{}",
+            unknown_err.0
+        );
+        assert!(unknown_err.0.contains("audit rules"), "{}", unknown_err.0);
+    }
+
+    #[test]
+    fn sarif_includes_tool_version_and_invocation_metadata() {
+        let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
+        let sarif = render_findings_with_limitations_and_scanned(
+            &findings,
+            AuditOutputFormat::Sarif,
+            &[],
+            0,
+            2,
+        )
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let driver = &report["runs"][0]["tool"]["driver"];
+        assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(driver["semanticVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(driver["informationUri"], env!("CARGO_PKG_REPOSITORY"));
+
+        let invocation = &report["runs"][0]["invocations"][0];
+        assert_eq!(invocation["executionSuccessful"], true);
+        assert_eq!(invocation["properties"]["filesScanned"], 2);
+        assert_eq!(invocation["properties"]["skippedFileCount"], 0);
+        assert_eq!(invocation["properties"]["findingCount"], findings.len());
+
+        let failed_sarif = render_findings_with_limitations_and_scanned(
+            &findings,
+            AuditOutputFormat::Sarif,
+            &["failed to parse broken.rs".to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+        let failed_report: serde_json::Value = serde_json::from_str(&failed_sarif).unwrap();
+        assert_eq!(
+            failed_report["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert_eq!(
+            failed_report["runs"][0]["invocations"][0]["properties"]["skippedFileCount"],
+            1
+        );
+    }
+
+    #[test]
+    fn build_baseline_entries_deduplicates_same_file_line_and_rule() {
+        let mut findings = vec![
+            sample_finding("src/lib.rs", 4, "unchecked-i128-arithmetic", "msg 1"),
+            sample_finding("src/lib.rs", 4, "unchecked-i128-arithmetic", "msg 2"),
+            sample_finding("src/lib.rs", 10, "missing-require-auth", "msg 3"),
+        ];
+        normalize_findings(&mut findings);
+        let entries = build_baseline_entries(&findings);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].file, "src/lib.rs");
+        assert_eq!(entries[0].line, 4);
+        assert_eq!(entries[0].rule, "unchecked-i128-arithmetic");
+        assert_eq!(entries[1].line, 10);
+    }
+
+    #[test]
+    fn write_baseline_file_writes_valid_json_and_rejects_directory() {
+        let root = std::env::temp_dir().join(format!("stk-baseline-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dir_err = write_baseline_file(&root, &[]).unwrap_err();
+        assert!(dir_err.0.contains("is a directory"), "{}", dir_err.0);
+
+        let target = root.join("nested/baseline.json");
+        let findings = vec![sample_finding(
+            "crates/vault/src/lib.rs",
+            3,
+            "missing-require-auth",
+            "missing auth",
+        )];
+        let written = write_baseline_file(&target, &findings).unwrap();
+        assert_eq!(written.len(), 1);
+        let loaded = load_baseline(&Some(target.clone())).unwrap();
+        assert_eq!(loaded, written);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

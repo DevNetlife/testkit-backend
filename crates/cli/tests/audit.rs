@@ -2193,6 +2193,201 @@ impl Vault {
 }
 
 #[test]
+fn audit_sarif_rules_include_help_uris() {
+    let fixture = AuditFixture::new("sarif-help-uri");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = amount + 1;
+    }
+}
+"#,
+    );
+    let output = fixture.scan(&["--format", "sarif"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rules = report["runs"][0]["tool"]["driver"]["rules"]
+        .as_array()
+        .unwrap();
+    assert!(!rules.is_empty(), "{report}");
+    for rule in rules {
+        let id = rule["id"].as_str().unwrap();
+        let help_uri = rule["helpUri"].as_str().unwrap();
+        assert!(help_uri.starts_with("https://"), "{help_uri}");
+        assert!(help_uri.ends_with(&format!("#{id}")), "{help_uri}");
+    }
+}
+
+#[test]
+fn audit_rule_flag_selects_specific_rules_and_rejects_unknown_identifiers() {
+    let source = br#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = amount + 1;
+    }
+}
+"#;
+
+    let single = run_with_stdin(
+        &[
+            "audit",
+            "-",
+            "--format",
+            "json",
+            "--rule",
+            "missing-require-auth",
+        ],
+        source,
+    );
+    assert!(single.status.success(), "{single:?}");
+    let report: serde_json::Value = serde_json::from_slice(&single.stdout).unwrap();
+    let rules: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(rules, vec!["missing-require-auth"]);
+
+    let multi = run_with_stdin(
+        &[
+            "audit",
+            "-",
+            "--format",
+            "json",
+            "--rule",
+            "missing-require-auth,unchecked-i128-arithmetic",
+        ],
+        source,
+    );
+    assert!(multi.status.success(), "{multi:?}");
+    let report: serde_json::Value = serde_json::from_slice(&multi.stdout).unwrap();
+    let multi_rules: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert!(multi_rules.contains(&"missing-require-auth"));
+    assert!(multi_rules.contains(&"unchecked-i128-arithmetic"));
+    assert!(!multi_rules.contains(&"missing-positive-amount-validation"));
+
+    let unknown = run_with_stdin(&["audit", "-", "--rule", "does-not-exist"], source);
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("unknown audit rule"), "{stderr}");
+    assert!(stderr.contains("audit rules"), "{stderr}");
+
+    let empty = run_with_stdin(&["audit", "-", "--rule", ""], source);
+    assert!(!empty.status.success());
+    let empty_err = String::from_utf8_lossy(&empty.stderr);
+    assert!(empty_err.contains("cannot be empty"), "{empty_err}");
+}
+
+#[test]
+fn audit_sarif_includes_tool_version_and_invocation_metadata() {
+    let fixture = AuditFixture::new("sarif-invocation");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let ok = fixture.scan(&["--format", "sarif"]);
+    assert!(ok.status.success(), "{ok:?}");
+    let report: serde_json::Value = serde_json::from_slice(&ok.stdout).unwrap();
+    let driver = &report["runs"][0]["tool"]["driver"];
+    assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(driver["semanticVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["runs"][0]["invocations"][0]["executionSuccessful"],
+        true
+    );
+    assert_eq!(
+        report["runs"][0]["invocations"][0]["properties"]["filesScanned"],
+        1
+    );
+
+    fixture.write("crates/vault/src/broken.rs", "fn broken( {\n");
+    let incomplete = fixture.scan(&["--format", "sarif"]);
+    assert!(!incomplete.status.success());
+    let incomplete_report: serde_json::Value = serde_json::from_slice(&incomplete.stdout).unwrap();
+    assert_eq!(
+        incomplete_report["runs"][0]["invocations"][0]["executionSuccessful"],
+        false
+    );
+    assert_eq!(
+        incomplete_report["runs"][0]["invocations"][0]["properties"]["skippedFileCount"],
+        1
+    );
+}
+
+#[test]
+fn audit_refresh_baseline_creates_updates_and_validates_target() {
+    let fixture = AuditFixture::new("refresh-baseline");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let create = run_from(&fixture.0, &["audit", "refresh-baseline", "baseline.json"]);
+    assert!(create.status.success(), "{create:?}");
+    let stdout = String::from_utf8_lossy(&create.stdout);
+    assert!(stdout.contains("refreshed baseline"), "{stdout}");
+    assert!(stdout.contains("1 entry"), "{stdout}");
+
+    // Using the freshly generated baseline should suppress the existing finding.
+    let clean = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(clean.status.success(), "{clean:?}");
+
+    // Add a second finding; --strict fails until we refresh the baseline.
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = amount + 1;
+    }
+}
+"#,
+    );
+    let dirty = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(!dirty.status.success());
+
+    let refresh = run_from(
+        &fixture.0,
+        &[
+            "audit",
+            "refresh-baseline",
+            "--output",
+            "baseline.json",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(refresh.status.success(), "{refresh:?}");
+    let refresh_json: serde_json::Value = serde_json::from_slice(&refresh.stdout).unwrap();
+    assert!(refresh_json["entry_count"].as_u64().unwrap() >= 2);
+
+    let clean_after_refresh = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(clean_after_refresh.status.success(), "{clean_after_refresh:?}");
+
+    // Passing a directory as the baseline target must fail actionably.
+    let dir_fail = run_from(&fixture.0, &["audit", "refresh-baseline", "crates"]);
+    assert!(!dir_fail.status.success());
+    let dir_err = String::from_utf8_lossy(&dir_fail.stderr);
+    assert!(dir_err.contains("is a directory"), "{dir_err}");
+
+    // Parse errors must refuse to overwrite the baseline.
+    let before = std::fs::read_to_string(fixture.0.join("baseline.json")).unwrap();
+    fixture.write("crates/vault/src/broken.rs", "fn broken( {\n");
+    let parse_fail = run_from(&fixture.0, &["audit", "refresh-baseline", "baseline.json"]);
+    assert!(!parse_fail.status.success());
+    let parse_err = String::from_utf8_lossy(&parse_fail.stderr);
+    assert!(parse_err.contains("cannot refresh baseline"), "{parse_err}");
+    let after = std::fs::read_to_string(fixture.0.join("baseline.json")).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn audit_allow_comment_via_new_syntax_works() {
     // Test the shorter audit:allow(<rule>) syntax (not requiring soroban_testkit prefix)
     let source = br#"
