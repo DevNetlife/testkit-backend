@@ -2193,6 +2193,35 @@ impl Vault {
 }
 
 #[test]
+fn audit_sarif_rules_include_help_uris() {
+    let fixture = AuditFixture::new("sarif-help-uri");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = amount + 1;
+    }
+}
+"#,
+    );
+    let output = fixture.scan(&["--format", "sarif"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rules = report["runs"][0]["tool"]["driver"]["rules"]
+        .as_array()
+        .unwrap();
+    assert!(!rules.is_empty(), "{report}");
+    for rule in rules {
+        let id = rule["id"].as_str().unwrap();
+        let help_uri = rule["helpUri"].as_str().unwrap();
+        assert!(help_uri.starts_with("https://"), "{help_uri}");
+        assert!(help_uri.ends_with(&format!("#{id}")), "{help_uri}");
+    }
+}
+
+#[test]
 fn audit_allow_comment_via_new_syntax_works() {
     // Test the shorter audit:allow(<rule>) syntax (not requiring soroban_testkit prefix)
     let source = br#"

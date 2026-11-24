@@ -44,6 +44,24 @@ or add `// audit:allow_all` to suppress all findings on that line.
 Suppressions apply only to the line they precede and do not cascade.
 Use `// audit:allow(<rule_id>, \"reason for suppression\")` to document why.";
 
+/// Returns the canonical documentation URI for a SARIF rule descriptor.
+///
+/// Returns `None` when `rule_id` is empty or whitespace-only so callers never
+/// emit a broken anchor-only URI.
+fn sarif_rule_help_uri(rule_id: &str) -> Option<String> {
+    let trimmed = rule_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let repo = env!("CARGO_PKG_REPOSITORY").trim_end_matches('/');
+    let base = if repo.is_empty() {
+        "https://github.com/soroban-testkit/soroban-testkit"
+    } else {
+        repo
+    };
+    Some(format!("{base}/blob/main/docs/audit-rules.md#{trimmed}"))
+}
+
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
 /// machine-readable listing) route through this one function, so the
@@ -1484,6 +1502,9 @@ impl<'a> DiagnosticRenderer<'a> {
                 });
                 if let Some(desc) = description {
                     rule_obj["fullDescription"] = serde_json::json!({ "text": desc });
+                }
+                if let Some(help_uri) = sarif_rule_help_uri(rule) {
+                    rule_obj["helpUri"] = serde_json::Value::String(help_uri);
                 }
                 if let Some(severity) = effective_severity {
                     rule_obj["defaultConfiguration"] =
@@ -4960,5 +4981,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("stale suppression"), "{}", err.0);
+    }
+
+    #[test]
+    fn sarif_rule_help_uri_builds_valid_anchors_and_rejects_empty_ids() {
+        assert_eq!(sarif_rule_help_uri(""), None);
+        assert_eq!(sarif_rule_help_uri("   "), None);
+        let uri = sarif_rule_help_uri("missing-require-auth").unwrap();
+        assert!(uri.starts_with("https://"), "{uri}");
+        assert!(uri.ends_with("#missing-require-auth"), "{uri}");
+    }
+
+    #[test]
+    fn sarif_output_includes_rule_help_uris() {
+        let findings = audit_source_for_test(
+            "pub fn deposit(from: Address, amount: i128) { let _ = amount + 1; }",
+        );
+        let sarif = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let rules = report["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert!(rules.len() >= 2, "{rules:?}");
+        let mut seen_uris = HashSet::new();
+        for rule in rules {
+            let id = rule["id"].as_str().unwrap();
+            let help_uri = rule["helpUri"].as_str().unwrap();
+            assert!(help_uri.starts_with("https://"), "{help_uri}");
+            assert!(help_uri.ends_with(&format!("#{id}")), "{help_uri}");
+            assert!(seen_uris.insert(help_uri.to_string()), "duplicate {help_uri}");
+        }
     }
 }
