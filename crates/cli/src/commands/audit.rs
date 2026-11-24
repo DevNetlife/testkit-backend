@@ -453,7 +453,23 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
                     "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
                     "version": "2.1.0",
                     "runs": [{
-                        "tool": { "driver": { "name": "soroban-testkit", "rules": [] } },
+                        "tool": {
+                            "driver": {
+                                "name": "soroban-testkit",
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "semanticVersion": env!("CARGO_PKG_VERSION"),
+                                "informationUri": env!("CARGO_PKG_REPOSITORY"),
+                                "rules": []
+                            }
+                        },
+                        "invocations": [{
+                            "executionSuccessful": true,
+                            "properties": {
+                                "filesScanned": 0,
+                                "skippedFileCount": 0,
+                                "findingCount": 0
+                            }
+                        }],
                         "results": [],
                         "properties": {
                             "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
@@ -1479,6 +1495,14 @@ impl<'a> DiagnosticRenderer<'a> {
     /// `level` on its `results`. Region snippets are sanitized before
     /// embedding.
     pub fn render_sarif(&self) -> Result<String, CliError> {
+        self.render_sarif_with_invocation(0)
+    }
+
+    /// Render SARIF 2.1.0 output with invocation status and skipped-file metadata.
+    pub fn render_sarif_with_invocation(
+        &self,
+        skipped_file_count: usize,
+    ) -> Result<String, CliError> {
         let mut rule_ids: Vec<_> = self.findings.iter().map(|finding| finding.rule).collect();
         rule_ids.sort_unstable();
         rule_ids.dedup();
@@ -1557,7 +1581,23 @@ impl<'a> DiagnosticRenderer<'a> {
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "version": "2.1.0",
             "runs": [{
-                "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
+                "tool": {
+                    "driver": {
+                        "name": "soroban-testkit",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "semanticVersion": env!("CARGO_PKG_VERSION"),
+                        "informationUri": env!("CARGO_PKG_REPOSITORY"),
+                        "rules": rules
+                    }
+                },
+                "invocations": [{
+                    "executionSuccessful": skipped_file_count == 0,
+                    "properties": {
+                        "filesScanned": self.effective_files_scanned(),
+                        "skippedFileCount": skipped_file_count,
+                        "findingCount": self.findings.len()
+                    }
+                }],
                 "results": results,
                 "properties": { "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE] }
             }]
@@ -1605,6 +1645,7 @@ pub fn render_findings_with_limitations_and_scanned(
         AuditOutputFormat::Json => {
             renderer.render_json_with_limitations(parser_limitations, skipped_file_count)
         }
+        AuditOutputFormat::Sarif => renderer.render_sarif_with_invocation(skipped_file_count),
         _ => renderer.render(format),
     }
 }
@@ -5103,5 +5144,47 @@ mod tests {
             unknown_err.0
         );
         assert!(unknown_err.0.contains("audit rules"), "{}", unknown_err.0);
+    }
+
+    #[test]
+    fn sarif_includes_tool_version_and_invocation_metadata() {
+        let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
+        let sarif = render_findings_with_limitations_and_scanned(
+            &findings,
+            AuditOutputFormat::Sarif,
+            &[],
+            0,
+            2,
+        )
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let driver = &report["runs"][0]["tool"]["driver"];
+        assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(driver["semanticVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(driver["informationUri"], env!("CARGO_PKG_REPOSITORY"));
+
+        let invocation = &report["runs"][0]["invocations"][0];
+        assert_eq!(invocation["executionSuccessful"], true);
+        assert_eq!(invocation["properties"]["filesScanned"], 2);
+        assert_eq!(invocation["properties"]["skippedFileCount"], 0);
+        assert_eq!(invocation["properties"]["findingCount"], findings.len());
+
+        let failed_sarif = render_findings_with_limitations_and_scanned(
+            &findings,
+            AuditOutputFormat::Sarif,
+            &["failed to parse broken.rs".to_string()],
+            1,
+            1,
+        )
+        .unwrap();
+        let failed_report: serde_json::Value = serde_json::from_str(&failed_sarif).unwrap();
+        assert_eq!(
+            failed_report["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert_eq!(
+            failed_report["runs"][0]["invocations"][0]["properties"]["skippedFileCount"],
+            1
+        );
     }
 }

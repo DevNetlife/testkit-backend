@@ -2289,6 +2289,40 @@ impl Contract {
 }
 
 #[test]
+fn audit_sarif_includes_tool_version_and_invocation_metadata() {
+    let fixture = AuditFixture::new("sarif-invocation");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let ok = fixture.scan(&["--format", "sarif"]);
+    assert!(ok.status.success(), "{ok:?}");
+    let report: serde_json::Value = serde_json::from_slice(&ok.stdout).unwrap();
+    let driver = &report["runs"][0]["tool"]["driver"];
+    assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(driver["semanticVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["runs"][0]["invocations"][0]["executionSuccessful"],
+        true
+    );
+    assert_eq!(
+        report["runs"][0]["invocations"][0]["properties"]["filesScanned"],
+        1
+    );
+
+    fixture.write("crates/vault/src/broken.rs", "fn broken( {\n");
+    let incomplete = fixture.scan(&["--format", "sarif"]);
+    assert!(!incomplete.status.success());
+    let incomplete_report: serde_json::Value = serde_json::from_slice(&incomplete.stdout).unwrap();
+    assert_eq!(
+        incomplete_report["runs"][0]["invocations"][0]["executionSuccessful"],
+        false
+    );
+    assert_eq!(
+        incomplete_report["runs"][0]["invocations"][0]["properties"]["skippedFileCount"],
+        1
+    );
+}
+
+#[test]
 fn audit_allow_comment_via_new_syntax_works() {
     // Test the shorter audit:allow(<rule>) syntax (not requiring soroban_testkit prefix)
     let source = br#"
