@@ -188,6 +188,10 @@ pub struct AuditArgs {
     /// include patterns.
     #[arg(long = "exclude", value_name = "GLOB_OR_DIR", action = clap::ArgAction::Append, global = true)]
     pub exclude: Vec<String>,
+    /// Run only the specified audit rule(s) by stable identifier (repeatable
+    /// or comma-separated). Use `soroban-testkit audit rules` to list valid IDs.
+    #[arg(long = "rule", value_name = "RULE_ID", value_delimiter = ',', action = clap::ArgAction::Append, global = true)]
+    pub rules: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -402,7 +406,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
     };
     let workspace = find_workspace_root(&source_dir);
-    let config = load_config(&source_dir, &workspace)?;
+    let mut config = load_config(&source_dir, &workspace)?;
+    apply_selected_rules(&args.rules, &mut config)?;
 
     let mut raw_exclusions = config.exclude.clone();
     raw_exclusions.extend(exclude_dirs);
@@ -1733,6 +1738,45 @@ pub const VALID_RULES: &[&str] = &[
     "unchecked-narrowing-conversion",
     "unchecked-timestamp-arithmetic",
 ];
+
+const EXTRA_SELECTABLE_RULES: &[&str] = &[
+    "inconsistent-validation-across-entry-points",
+    "zero-transfer-amount",
+    "arithmetic-before-range-check",
+];
+
+fn is_known_rule_id(rule_id: &str) -> bool {
+    VALID_RULES.contains(&rule_id) || EXTRA_SELECTABLE_RULES.contains(&rule_id)
+}
+
+/// Validates `--rule` selections and restricts `config.rules` to only the
+/// requested stable rule identifiers while preserving configured severities.
+fn apply_selected_rules(selected: &[String], config: &mut AuditConfig) -> Result<(), CliError> {
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let mut chosen = HashSet::new();
+    for raw in selected {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(CliError(
+                "rule identifier cannot be empty; run `soroban-testkit audit rules` to list valid rule identifiers"
+                    .to_string(),
+            ));
+        }
+        if !is_known_rule_id(trimmed) {
+            return Err(CliError(format!(
+                "unknown audit rule `{trimmed}`; run `soroban-testkit audit rules` to list valid rule identifiers"
+            )));
+        }
+        chosen.insert(trimmed.to_string());
+    }
+    for &rule_id in VALID_RULES.iter().chain(EXTRA_SELECTABLE_RULES.iter()) {
+        let entry = config.rules.entry(rule_id.to_string()).or_default();
+        entry.enabled = chosen.contains(rule_id);
+    }
+    Ok(())
+}
 
 pub const VALID_SEVERITIES: &[&str] = &["error", "warning", "note"];
 
@@ -5011,5 +5055,53 @@ mod tests {
             assert!(help_uri.ends_with(&format!("#{id}")), "{help_uri}");
             assert!(seen_uris.insert(help_uri.to_string()), "duplicate {help_uri}");
         }
+    }
+
+    #[test]
+    fn apply_selected_rules_filters_to_requested_identifiers_and_preserves_severity() {
+        let mut config = AuditConfig::default();
+        config.rules.insert(
+            "missing-require-auth".to_string(),
+            RuleConfig {
+                enabled: false,
+                severity: Some("error".to_string()),
+            },
+        );
+        apply_selected_rules(&["missing-require-auth".to_string()], &mut config).unwrap();
+        assert!(config.rules["missing-require-auth"].enabled);
+        assert_eq!(
+            config.rules["missing-require-auth"].severity.as_deref(),
+            Some("error")
+        );
+        assert!(!config.rules["unchecked-i128-arithmetic"].enabled);
+
+        let mut findings = Vec::new();
+        audit_source(
+            Path::new("<test>"),
+            "pub fn withdraw(env: Env, from: Address, amount: i128) { let _ = amount + 1; }",
+            &mut findings,
+            &config,
+            "pub fn withdraw(env: Env, from: Address, amount: i128) { let _ = amount + 1; }",
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "missing-require-auth");
+        assert_eq!(findings[0].severity, "error");
+    }
+
+    #[test]
+    fn apply_selected_rules_rejects_empty_and_unknown_identifiers() {
+        let mut config = AuditConfig::default();
+        let empty_err = apply_selected_rules(&["".to_string()], &mut config).unwrap_err();
+        assert!(empty_err.0.contains("cannot be empty"), "{}", empty_err.0);
+
+        let unknown_err =
+            apply_selected_rules(&["not-a-real-rule".to_string()], &mut config).unwrap_err();
+        assert!(
+            unknown_err.0.contains("unknown audit rule `not-a-real-rule`"),
+            "{}",
+            unknown_err.0
+        );
+        assert!(unknown_err.0.contains("audit rules"), "{}", unknown_err.0);
     }
 }

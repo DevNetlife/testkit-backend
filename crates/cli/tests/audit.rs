@@ -2222,6 +2222,73 @@ impl Contract {
 }
 
 #[test]
+fn audit_rule_flag_selects_specific_rules_and_rejects_unknown_identifiers() {
+    let source = br#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = amount + 1;
+    }
+}
+"#;
+
+    let single = run_with_stdin(
+        &[
+            "audit",
+            "-",
+            "--format",
+            "json",
+            "--rule",
+            "missing-require-auth",
+        ],
+        source,
+    );
+    assert!(single.status.success(), "{single:?}");
+    let report: serde_json::Value = serde_json::from_slice(&single.stdout).unwrap();
+    let rules: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(rules, vec!["missing-require-auth"]);
+
+    let multi = run_with_stdin(
+        &[
+            "audit",
+            "-",
+            "--format",
+            "json",
+            "--rule",
+            "missing-require-auth,unchecked-i128-arithmetic",
+        ],
+        source,
+    );
+    assert!(multi.status.success(), "{multi:?}");
+    let report: serde_json::Value = serde_json::from_slice(&multi.stdout).unwrap();
+    let multi_rules: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert!(multi_rules.contains(&"missing-require-auth"));
+    assert!(multi_rules.contains(&"unchecked-i128-arithmetic"));
+    assert!(!multi_rules.contains(&"missing-positive-amount-validation"));
+
+    let unknown = run_with_stdin(&["audit", "-", "--rule", "does-not-exist"], source);
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("unknown audit rule"), "{stderr}");
+    assert!(stderr.contains("audit rules"), "{stderr}");
+
+    let empty = run_with_stdin(&["audit", "-", "--rule", ""], source);
+    assert!(!empty.status.success());
+    let empty_err = String::from_utf8_lossy(&empty.stderr);
+    assert!(empty_err.contains("cannot be empty"), "{empty_err}");
+}
+
+#[test]
 fn audit_allow_comment_via_new_syntax_works() {
     // Test the shorter audit:allow(<rule>) syntax (not requiring soroban_testkit prefix)
     let source = br#"
